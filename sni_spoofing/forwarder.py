@@ -1,20 +1,15 @@
-"""Core TCP forwarder with DPI bypass and automatic failover.
+"""Core TCP forwarder with DPI bypass.
 
 This is the main engine that:
 1. Listens for incoming TCP connections
 2. Reads the first TLS ClientHello from the client
-3. Resolves the target IP (static or auto-scanned)
+3. Connects to the configured upstream IP
 4. Applies the chosen DPI bypass strategy
 5. Relays data bidirectionally between client and server
-6. Detects blocked connections and triggers failover
 
 When a raw injector is available (Linux + root), it registers each
 outgoing connection so the sniffer can capture the SYN/ACK handshake
 and inject the fake ClientHello with an out-of-window seq number.
-
-When the internal scanner is active, the forwarder automatically
-selects the best Cloudflare IP and SNI, and rotates to a new one
-if the current selection becomes unreachable.
 """
 
 import asyncio
@@ -128,20 +123,16 @@ async def handle_connection(
     bypass_strategy: BypassStrategy,
     interface_ip: Optional[str] = None,
     raw_injector=None,
-    scan_engine=None,
-    sni_provider=None,
 ):
     """Handle a single incoming connection.
 
     Flow:
     1. Read first data from client (should be TLS ClientHello)
-    2. Resolve target IP -- use scanner's best IP if available
-    3. Create outgoing socket, optionally register with raw injector
-    4. Connect to target server (3-way handshake happens here;
+    2. Create outgoing socket, optionally register with raw injector
+    3. Connect to target server (3-way handshake happens here;
        the raw injector captures SYN and injects after 3rd ACK)
-    5. Apply the bypass strategy (sends real data, waits for inject confirmation)
-    6. Relay data bidirectionally
-    7. On failure, report to scanner for failover
+    4. Apply the bypass strategy (sends real data, waits for inject confirmation)
+    5. Relay data bidirectionally
     """
     loop = asyncio.get_running_loop()
     outgoing_sock = None
@@ -159,16 +150,6 @@ async def handle_connection(
         if not first_data:
             incoming_sock.close()
             return
-
-        # If scanner is running, pick the best available IP
-        if scan_engine is not None:
-            best = scan_engine.get_best_ip()
-            if best:
-                active_ip = best
-
-        # If SNI provider is available, pick the best SNI
-        if sni_provider is not None:
-            active_sni = sni_provider.get_best()
 
         # Parse to see if it's a TLS ClientHello
         parsed = ClientHelloBuilder.parse_client_hello(first_data)
@@ -213,21 +194,12 @@ async def handle_connection(
                 timeout=15.0,
             )
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as exc:
-            # Connection failed -- record failure for failover
             fail_count = _conn_tracker.record_failure(active_ip)
             logger.debug(
                 "[%s:%d] Connect to %s failed (%d/%d): %s",
                 incoming_addr[0], incoming_addr[1], active_ip,
                 fail_count, FAILOVER_THRESHOLD, exc,
             )
-            if _conn_tracker.should_failover(active_ip) and scan_engine:
-                scan_engine.report_failure(active_ip)
-                logger.warning(
-                    "IP %s reached failure threshold -- triggering failover",
-                    active_ip,
-                )
-            if sni_provider is not None:
-                sni_provider.mark_failed(active_sni)
             raise
 
         # If we didn't know the port before, grab it now
@@ -279,8 +251,6 @@ async def handle_connection(
                     if label == "S->C" and not server_responded:
                         server_responded = True
                         _conn_tracker.record_success(active_ip)
-                        if sni_provider is not None:
-                            sni_provider.mark_success(active_sni)
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
             except Exception:
@@ -301,16 +271,7 @@ async def handle_connection(
         # This catches cases where DPI allows the handshake but
         # blocks or RSTs actual application data.
         if not server_responded:
-            fail_count = _conn_tracker.record_failure(active_ip)
-            if _conn_tracker.should_failover(active_ip) and scan_engine:
-                scan_engine.report_failure(active_ip)
-                logger.warning(
-                    "IP %s reached failure threshold (no server response) "
-                    "-- triggering failover",
-                    active_ip,
-                )
-            if sni_provider is not None:
-                sni_provider.mark_failed(active_sni)
+            _conn_tracker.record_failure(active_ip)
 
     except asyncio.TimeoutError:
         logger.debug(f"[{incoming_addr[0]}:{incoming_addr[1]}] Connection timeout")
@@ -340,20 +301,11 @@ async def start_server(
     bypass_strategy: BypassStrategy,
     interface_ip: Optional[str] = None,
     raw_injector=None,
-    scan_engine=None,
-    sni_provider=None,
 ):
     """Start the TCP forwarding server.
 
     Creates a listening socket and handles incoming connections,
     applying the DPI bypass strategy to each one.
-
-    When *scan_engine* is provided, the server uses its best IP
-    instead of the static *connect_ip*, and triggers automatic
-    failover when connections are blocked.
-
-    When *sni_provider* is provided, the fake SNI is dynamically
-    selected from the provider's healthy domain list.
     """
     # Raise the OS file-descriptor limit before binding
     _raise_fd_limit()
@@ -385,20 +337,8 @@ async def start_server(
     conn_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
 
     logger.info(f"Listening on {listen_host}:{listen_port}")
-    if scan_engine is not None:
-        best = scan_engine.get_best_ip()
-        if best:
-            logger.info(f"Auto-selected IP: {best} (scanner active)")
-        else:
-            logger.info(f"Scanner active -- will select IP after first scan")
-        logger.info(f"Fallback IP: {connect_ip}:{connect_port}")
-    else:
-        logger.info(f"Forwarding to {connect_ip}:{connect_port}")
-    if sni_provider is not None:
-        logger.info(f"SNI provider active: {len(sni_provider.alive_domains)} domains")
-        logger.info(f"Current best SNI: {sni_provider.get_best()}")
-    else:
-        logger.info(f"Fake SNI: {fake_sni}")
+    logger.info(f"Forwarding to {connect_ip}:{connect_port}")
+    logger.info(f"Fake SNI: {fake_sni}")
     logger.info(f"Bypass strategy: {bypass_strategy.name}")
     if raw_injector is not None:
         logger.info("Raw packet injection: ACTIVE (seq_id trick enabled)")
@@ -422,8 +362,6 @@ async def start_server(
                 bypass_strategy=bypass_strategy,
                 interface_ip=interface_ip,
                 raw_injector=raw_injector,
-                scan_engine=scan_engine,
-                sni_provider=sni_provider,
             )
 
     try:

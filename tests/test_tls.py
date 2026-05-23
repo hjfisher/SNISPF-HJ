@@ -271,54 +271,31 @@ class TestRawInjector(unittest.TestCase):
         self.assertIsInstance(result, bool)
 
 
-class TestProbeValidation(unittest.TestCase):
-    """Test probe HTTP validation and MITM detection."""
+class TestDomainChecker(unittest.TestCase):
+    """Test the bulk Cloudflare-domain checker."""
 
-    def test_legitimate_issuer_detection(self):
-        """Known Cloudflare CA issuers should be accepted."""
-        from sni_spoofing.scanner.probe import IPProbe
-        probe = IPProbe()
-        self.assertTrue(probe._is_legitimate_issuer("Cloudflare Inc"))
-        self.assertTrue(probe._is_legitimate_issuer("DigiCert Inc"))
-        self.assertTrue(probe._is_legitimate_issuer("Google Trust Services LLC"))
-        self.assertTrue(probe._is_legitimate_issuer("Let's Encrypt"))
-        self.assertTrue(probe._is_legitimate_issuer("ISRG Root X1"))
-        self.assertTrue(probe._is_legitimate_issuer("E1"))
-        self.assertTrue(probe._is_legitimate_issuer("R3"))
-        self.assertTrue(probe._is_legitimate_issuer("Sectigo Limited"))
-        self.assertTrue(probe._is_legitimate_issuer("GlobalSign"))
-        self.assertTrue(probe._is_legitimate_issuer("Baltimore CyberTrust Root"))
+    def test_is_cloudflare_ip_positive(self):
+        """Known Cloudflare IPs should be detected."""
+        from sni_spoofing.scanner import is_cloudflare_ip
+        # 104.16.0.0/13 belongs to Cloudflare
+        self.assertTrue(is_cloudflare_ip("104.16.1.1"))
+        self.assertTrue(is_cloudflare_ip("172.64.0.1"))
 
-    def test_mitm_issuer_rejected(self):
-        """Unknown certificate issuers should be rejected."""
-        from sni_spoofing.scanner.probe import IPProbe
-        probe = IPProbe()
-        self.assertFalse(probe._is_legitimate_issuer("My ISP MITM CA"))
-        self.assertFalse(probe._is_legitimate_issuer("Government Root CA"))
-        self.assertFalse(probe._is_legitimate_issuer("Kaspersky Lab"))
-        self.assertFalse(probe._is_legitimate_issuer("mitmproxy"))
-        self.assertFalse(probe._is_legitimate_issuer("Charles Proxy"))
+    def test_is_cloudflare_ip_negative(self):
+        """Non-Cloudflare IPs should be rejected."""
+        from sni_spoofing.scanner import is_cloudflare_ip
+        self.assertFalse(is_cloudflare_ip("8.8.8.8"))
+        self.assertFalse(is_cloudflare_ip("1.1.1.1"))   # Cloudflare DNS, not CDN
+        self.assertFalse(is_cloudflare_ip("not-an-ip"))
+        self.assertFalse(is_cloudflare_ip(""))
 
-    def test_empty_issuer_rejected(self):
-        """Empty issuer string should be rejected."""
-        from sni_spoofing.scanner.probe import IPProbe
-        probe = IPProbe()
-        self.assertFalse(probe._is_legitimate_issuer(""))
-
-    def test_cloudflare_trace_markers(self):
-        """Cloudflare trace markers constant should be defined."""
-        from sni_spoofing.scanner.probe import CLOUDFLARE_TRACE_MARKERS
-        self.assertIn("fl=", CLOUDFLARE_TRACE_MARKERS)
-        self.assertIn("h=", CLOUDFLARE_TRACE_MARKERS)
-        self.assertIn("colo=", CLOUDFLARE_TRACE_MARKERS)
-
-    def test_probe_result_requires_http(self):
-        """Alive requires http_ok to be True."""
-        from sni_spoofing.scanner.probe import ProbeResult
-        r = ProbeResult(ip="1.2.3.4", tcp_ok=True, tls_ok=True, http_ok=False)
-        self.assertFalse(r.alive)
-        r2 = ProbeResult(ip="1.2.3.4", tcp_ok=True, tls_ok=True, http_ok=True)
-        self.assertTrue(r2.alive)
+    def test_domain_result_usable_as_sni(self):
+        """DomainResult.usable_as_sni requires CF + TCP + TLS."""
+        from sni_spoofing.scanner import DomainResult
+        r = DomainResult(domain="x.com", is_cloudflare=True, tcp_ok=True, tls_ok=True)
+        self.assertTrue(r.usable_as_sni)
+        r2 = DomainResult(domain="x.com", is_cloudflare=False, tcp_ok=True, tls_ok=True)
+        self.assertFalse(r2.usable_as_sni)
 
 
 class TestUtilities(unittest.TestCase):
@@ -441,17 +418,6 @@ class TestUtilities(unittest.TestCase):
                   "USE_TTL_TRICK": True, "FRAGMENT_DELAY": 0.1}
         strategy = build_strategy(config)
         self.assertTrue(strategy.use_ttl_trick)
-
-    def test_sni_priority_in_provider(self):
-        """Test that explicit SNI is prioritized in SNI provider."""
-        from sni_spoofing.scanner.sni_provider import SNIProvider
-
-        p = SNIProvider(domains=["a.com", "b.com", "c.com"])
-        p.add_domain("user-choice.com")
-        p.mark_success("user-choice.com", latency_ms=1.0)
-        # user-choice.com should be returned as best (lowest latency)
-        self.assertEqual(p.get_best(), "user-choice.com")
-
 
     def test_parse_host_port_no_port(self):
         """Test parse_host_port with just an IP (no port)."""
