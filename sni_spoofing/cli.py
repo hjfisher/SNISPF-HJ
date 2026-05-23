@@ -47,21 +47,34 @@ from sni_spoofing.utils import (
 
 # ─── Banner ──────────────────────────────────────────────────────────────────
 
-BANNER = r"""
- ███████╗███╗   ██╗██╗███████╗██████╗ ███████╗
- ██╔════╝████╗  ██║██║██╔════╝██╔══██╗██╔════╝
- ███████╗██╔██╗ ██║██║███████╗██████╔╝█████╗
- ╚════██║██║╚██╗██║██║╚════██║██╔═══╝ ██╔══╝
- ███████║██║ ╚████║██║███████║██║     ██║
- ╚══════╝╚═╝  ╚═══╝╚═╝╚══════╝╚═╝     ╚═╝
+def _build_banner() -> str:
+    """Render the startup banner with the current package version.
 
-     ┌──────────────────────────────────────────────────────────────────┐
-     │  SNISPF - Cross-Platform DPI Bypass Tool                        │
-     │  SNI Spoofing + TLS Fragmentation + Auto Scanner  v1.7.0        │
-     │  Works on Windows / macOS / Linux                               │
-     │  https://github.com/Rainman69/SNISPF                            │
-     └──────────────────────────────────────────────────────────────────┘
-"""
+    The version is read from ``sni_spoofing.__version__`` so the banner always
+    matches the installed package (fixes the long-standing "source still says
+    v1.7.0" reports from users who clone the repo at a newer release).
+    """
+    version_line = f"SNI Spoofing + TLS Fragmentation + Auto Scanner  v{__version__}"
+    # Inside-the-box content is 63 chars wide (between '│  ' and the trailing '│').
+    return (
+        "\n"
+        " ███████╗███╗   ██╗██╗███████╗██████╗ ███████╗\n"
+        " ██╔════╝████╗  ██║██║██╔════╝██╔══██╗██╔════╝\n"
+        " ███████╗██╔██╗ ██║██║███████╗██████╔╝█████╗\n"
+        " ╚════██║██║╚██╗██║██║╚════██║██╔═══╝ ██╔══╝\n"
+        " ███████║██║ ╚████║██║███████║██║     ██║\n"
+        " ╚══════╝╚═╝  ╚═══╝╚═╝╚══════╝╚═╝     ╚═╝\n"
+        "\n"
+        "     ┌──────────────────────────────────────────────────────────────────┐\n"
+        "     │  SNISPF - Cross-Platform DPI Bypass Tool                        │\n"
+        f"     │  {version_line:<63}│\n"
+        "     │  Works on Windows / macOS / Linux                               │\n"
+        "     │  https://github.com/Rainman69/SNISPF                            │\n"
+        "     └──────────────────────────────────────────────────────────────────┘\n"
+    )
+
+
+BANNER = _build_banner()
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
