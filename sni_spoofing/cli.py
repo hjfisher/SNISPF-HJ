@@ -34,6 +34,7 @@ from sni_spoofing.bypass import (
     is_raw_available,
 )
 from sni_spoofing.forwarder import start_server
+from sni_spoofing.pool import build_connection_manager
 from sni_spoofing.utils import (
     check_platform_capabilities,
     get_default_interface_ipv4,
@@ -571,6 +572,20 @@ def main():
     # Resolve target host if needed
     config["CONNECT_IP"] = resolve_host(config["CONNECT_IP"])
 
+    # ── Build connection pool (multi-IP / multi-SNI) ──────────────────
+    # build_connection_manager returns None when only a single IP+SNI is
+    # configured, in which case the server falls back to the original
+    # single-target code path.  When a pool IS available, the "primary"
+    # CONNECT_IP and FAKE_SNI values are set to the first list entries so
+    # that the raw injector (which still needs a single remote IP) still
+    # works for the most common upstream.
+    conn_manager = build_connection_manager(config)
+    if conn_manager is not None:
+        # Derive a representative IP for interface detection and raw injector.
+        first_ip = list(conn_manager.explorer.stats.keys())[0][0]
+        config.setdefault("CONNECT_IP", first_ip)
+        config.setdefault("FAKE_SNI", list(conn_manager.explorer.stats.keys())[0][1])
+
     # Detect interface IP
     interface_ip = get_default_interface_ipv4(config["CONNECT_IP"])
     logger.info(f"Default interface: {interface_ip or 'auto'}")
@@ -621,6 +636,15 @@ def main():
     logger.info(f"Platform: {platform.system()} {platform.machine()}")
     logger.info(f"Python: {platform.python_version()}")
 
+    # ── Start pool health loop in background daemon thread ────────────
+    if conn_manager is not None:
+        conn_manager.start_health_loop()
+        logger.info(
+            "Connection pool active — %d pair(s), %d active slot(s)",
+            len(conn_manager.explorer.stats),
+            conn_manager.pool.slots,
+        )
+
     # Setup signal handlers for graceful shutdown
     def signal_handler(sig, frame):
         print("\n\nShutting down...")
@@ -644,6 +668,7 @@ def main():
                 bypass_strategy=strategy,
                 interface_ip=interface_ip,
                 raw_injector=raw_injector,
+                conn_manager=conn_manager,
             )
         )
     except KeyboardInterrupt:
