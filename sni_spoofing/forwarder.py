@@ -18,7 +18,7 @@ import socket
 import sys
 import time
 import traceback
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 # `resource` is a POSIX-only module (Linux/macOS/BSD). It does not exist on
 # Windows, so we import it defensively and skip the fd-limit tweak there.
@@ -29,6 +29,10 @@ except ImportError:  # pragma: no cover -- Windows
 
 from .bypass.base import BypassStrategy
 from .tls import ClientHelloBuilder
+
+if TYPE_CHECKING:
+    # Avoid a circular import; only needed for type annotations.
+    from .pool import ConnectionManager, PairStats
 
 logger = logging.getLogger("snispf")
 
@@ -123,22 +127,54 @@ async def handle_connection(
     bypass_strategy: BypassStrategy,
     interface_ip: Optional[str] = None,
     raw_injector=None,
+    conn_manager: "Optional[ConnectionManager]" = None,
 ):
     """Handle a single incoming connection.
 
+    When a ``conn_manager`` (ConnectionManager) is supplied the (IP, SNI)
+    pair is chosen dynamically via the pool's weighted-random picker.
+    Statistics are recorded so the pool can track real-traffic loss and
+    rotate out degraded upstreams without dropping live connections.
+
     Flow:
     1. Read first data from client (should be TLS ClientHello)
-    2. Create outgoing socket, optionally register with raw injector
-    3. Connect to target server (3-way handshake happens here;
+    2. Pick upstream (IP, SNI) — from pool or from static config
+    3. Create outgoing socket, optionally register with raw injector
+    4. Connect to target server (3-way handshake happens here;
        the raw injector captures SYN and injects after 3rd ACK)
-    4. Apply the bypass strategy (sends real data, waits for inject confirmation)
-    5. Relay data bidirectionally
+    5. Apply the bypass strategy (sends real data, waits for inject
+       confirmation)
+    6. Relay data bidirectionally; update pool stats on completion
     """
     loop = asyncio.get_running_loop()
     outgoing_sock = None
     local_port = None
-    active_ip = connect_ip
-    active_sni = fake_sni
+
+    # ── Pool integration: pick the best (IP, SNI) pair ────────────────
+    # If a ConnectionManager is available, override the static config values
+    # with the pool's weighted-random selection so degraded upstreams are
+    # avoided and the best pairs are favoured.
+    pair = None
+    if conn_manager is not None:
+        pair = conn_manager.pick_pair()
+        active_ip = pair.ip
+        active_sni = pair.sni
+        with pair.lock:
+            pair.active_connections += 1
+            pair.total_connections += 1
+    else:
+        active_ip = connect_ip
+        active_sni = fake_sni
+
+    def _release_pair(failed: bool = False) -> None:
+        """Decrement the active-connection counter and optionally report failure."""
+        if pair is None:
+            return
+        with pair.lock:
+            pair.active_connections = max(0, pair.active_connections - 1)
+        if failed:
+            pair.record_real_packet(lost=True)
+            conn_manager.report_failure(pair)
 
     try:
         # Read the first data from client (should be TLS ClientHello)
@@ -149,6 +185,7 @@ async def handle_connection(
 
         if not first_data:
             incoming_sock.close()
+            _release_pair(failed=False)
             return
 
         # Parse to see if it's a TLS ClientHello
@@ -158,6 +195,7 @@ async def handle_connection(
             f"[{incoming_addr[0]}:{incoming_addr[1]}] -> "
             f"{active_ip}:{connect_port} | SNI: {client_sni} | "
             f"Fake: {active_sni} | Method: {bypass_strategy.name}"
+            + (f" | pool_loss={pair.combined_loss_rate*100:.1f}%" if pair else "")
         )
 
         # Create outgoing socket
@@ -251,6 +289,9 @@ async def handle_connection(
                     if label == "S->C" and not server_responded:
                         server_responded = True
                         _conn_tracker.record_success(active_ip)
+                        # Also record a successful real packet for the pool.
+                        if pair is not None:
+                            pair.record_real_packet(lost=False)
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
             except Exception:
@@ -272,11 +313,16 @@ async def handle_connection(
         # blocks or RSTs actual application data.
         if not server_responded:
             _conn_tracker.record_failure(active_ip)
+            _release_pair(failed=True)
+        else:
+            _release_pair(failed=False)
 
     except asyncio.TimeoutError:
         logger.debug(f"[{incoming_addr[0]}:{incoming_addr[1]}] Connection timeout")
+        _release_pair(failed=True)
     except Exception:
         logger.debug(f"Connection handler error: {traceback.format_exc()}")
+        _release_pair(failed=True)
     finally:
         try:
             incoming_sock.close()
@@ -301,8 +347,14 @@ async def start_server(
     bypass_strategy: BypassStrategy,
     interface_ip: Optional[str] = None,
     raw_injector=None,
+    conn_manager: "Optional[ConnectionManager]" = None,
 ):
     """Start the TCP forwarding server.
+
+    When ``conn_manager`` is supplied, each incoming connection picks its
+    upstream (IP, SNI) from the pool instead of using the static
+    ``connect_ip`` / ``fake_sni`` values.  The static values are kept as
+    fallback defaults so the function signature stays backwards-compatible.
 
     Creates a listening socket and handles incoming connections,
     applying the DPI bypass strategy to each one.
@@ -337,8 +389,11 @@ async def start_server(
     conn_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
 
     logger.info(f"Listening on {listen_host}:{listen_port}")
-    logger.info(f"Forwarding to {connect_ip}:{connect_port}")
-    logger.info(f"Fake SNI: {fake_sni}")
+    if conn_manager is not None:
+        logger.info("Upstream selection: POOL (multi-IP / multi-SNI)")
+    else:
+        logger.info(f"Forwarding to {connect_ip}:{connect_port}")
+        logger.info(f"Fake SNI: {fake_sni}")
     logger.info(f"Bypass strategy: {bypass_strategy.name}")
     if raw_injector is not None:
         logger.info("Raw packet injection: ACTIVE (seq_id trick enabled)")
@@ -362,6 +417,7 @@ async def start_server(
                 bypass_strategy=bypass_strategy,
                 interface_ip=interface_ip,
                 raw_injector=raw_injector,
+                conn_manager=conn_manager,
             )
 
     try:
