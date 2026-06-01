@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "snispf"
+name = "snispf-hj"
 version = "2.0.0"
 description = "SNISPF - Cross-platform DPI bypass tool via SNI spoofing"
 readme = "README.md"
@@ -37,7 +37,7 @@ Repository = "https://github.com/Rainman69/SNISPF"
 Issues = "https://github.com/Rainman69/SNISPF/issues"
 
 [project.scripts]
-snispf = "sni_spoofing.cli:main"
+snispf-hj = "sni_spoofing.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["sni_spoofing*"]
