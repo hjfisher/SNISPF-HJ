@@ -1,6 +1,6 @@
-# SNISPF
+# SNISPF-HJ
 
-### ابزار خط‌فرمان دور زدن DPI روی همه پلتفرم‌ها
+### ابزار خط‌فرمان دور زدن DPI روی همه پلتفرم‌ها — با pool تطبیقی چند-IP/چند-SNI
 
 ```
  ███████╗███╗   ██╗██╗███████╗██████╗ ███████╗
@@ -10,56 +10,104 @@
  ███████║██║ ╚████║██║███████║██║     ██║
  ╚══════╝╚═╝  ╚═══╝╚═╝╚══════╝╚═╝     ╚═╝
 ```
-**[EN README](https://github.com/Rainman69/SNISPF/blob/main/README.md)**
 
-**SNISPF** یک ابزار سبک خط‌فرمان است که به شما کمک می‌کند فیلترینگ مبتنی بر
-SNI/DPI را دور بزنید. روش کار این است که شیوهٔ معرفی اتصال شما به فایروال را
-دستکاری می‌کند تا سامانهٔ فیلترینگ نتواند نام واقعی سایت را بخواند. روی
-**Windows، macOS و Linux** کار می‌کند و برای روش پیش‌فرض نیازی به دسترسی
-ریشه (root) ندارد.
+**[EN README](README.md)**
+
+**SNISPF-HJ** یک فورک از [SNISPF](https://github.com/Rainman69/SNISPF) ساختهٔ
+[@Rainman69](https://github.com/Rainman69) است که با یک **pool تطبیقی چند-IP / چند-SNI**
+تقویت شده — ایده‌ای که از کارهای
+[@patterniha](https://github.com/patterniha) و
+[@hjfisher](https://github.com/hjfisher) الهام گرفته است.
+
+به‌جای یک upstream ثابت، ابزار به‌طور مداوم ترکیب‌های (IP، SNI) را بررسی
+می‌کند و هر اتصال را از طریق سالم‌ترین جفت هدایت می‌کند — بدون قطع شدن
+اتصال‌های فعال.
+
+روی **Windows، macOS، Linux و Android (Termux)** کار می‌کند و برای روش
+پیش‌فرض نیازی به دسترسی root ندارد.
 
 پیشنهاد یا سؤال؟ → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discussions)**
 
-**نگه‌داری شده توسط [@Rainman69](https://github.com/Rainman69)**
+‎**⭐️ فراموش نشه ⭐️**
 
 ---
 
 ## فهرست
 
+- [چه چیزی جدید است؟](#چه-چیزی-جدید-است)
 - [چطور کار می‌کند؟](#چطور-کار-میکند)
 - [پیش‌نیازها](#پیشنیازها)
 - [نصب](#نصب)
 - [شروع سریع](#شروع-سریع)
 - [پیکربندی](#پیکربندی)
+- [تنظیمات Pool](#تنظیمات-pool)
 - [پرچم‌های CLI](#پرچمهای-cli)
 - [روش‌های دور زدن](#روشهای-دور-زدن)
-- [استراتژی‌های قطعه‌قطعه کردن](#استراتژیهای-قطعهقطعه-کردن)
+- [استراتژی‌های قطعه‌بندی](#استراتژیهای-قطعهبندی)
 - [بررسی‌گر دامنه](#بررسیگر-دامنه)
 - [پشتیبانی از پلتفرم‌ها](#پشتیبانی-از-پلتفرمها)
 - [رفع اشکال](#رفع-اشکال)
+- [ساختار پروژه](#ساختار-پروژه)
+- [تشکر و منابع](#تشکر-و-منابع)
 - [لایسنس](#لایسنس)
+
+---
+
+## چه چیزی جدید است؟
+
+| قابلیت | SNISPF اصلی | SNISPF-HJ |
+|---|---|---|
+| upstream | یک IP + یک SNI | چند IP × چند SNI |
+| بررسی سلامت | ندارد | حلقهٔ TCP probe مداوم |
+| انتخاب جفت | ثابت | وزن‌دار تصادفی (loss کمتر = احتمال بیشتر) |
+| جایگزینی بدون قطعی | ندارد | draining: اتصال‌های زنده تمام می‌شوند، جفت‌های ضعیف جایگزین می‌شوند |
+| دستور اجرا | `snispf` | `snispf` **و** `snispf-hj` |
+| کلیدهای کانفیگ | `CONNECT_IP`، `FAKE_SNI` | `CONNECT_IPS` (لیست)، `FAKE_SNIS` (لیست) |
+| ماژول pool | ندارد | `sni_spoofing/pool.py` |
+
+تمام قابلیت‌های اصلی (fragmentation، fake-SNI، combined، domain checker،
+raw injection، TTL trick) کاملاً حفظ شده‌اند.
 
 ---
 
 ## چطور کار می‌کند؟
 
-وقتی یک سایت HTTPS باز می‌کنی، دستگاهت یک پیام «سلام» (TLS ClientHello)
-می‌فرستد که نام سایت داخل آن به‌صورت **متن خام** قرار دارد. این نام **SNI**
-(Server Name Indication) خوانده می‌شود. سامانهٔ فیلترینگ (DPI) همین نام را
-می‌بیند و تصمیم می‌گیرد اتصال را قطع کند یا نه.
+وقتی یک سایت HTTPS باز می‌کنی، دستگاهت یک **TLS ClientHello** می‌فرستد که
+نام سایت به‌صورت متن خام داخل آن است — این **SNI** (Server Name Indication)
+نام دارد. سامانهٔ فیلترینگ (DPI) همین نام را می‌بیند و تصمیم می‌گیرد.
 
-SNISPF بین برنامهٔ تو و اینترنت می‌نشیند؛ پیام «سلام» را یا **قطعه‌قطعه**
-می‌کند یا **یک سلام جعلی** قبل از آن می‌فرستد تا DPI نتواند نام واقعی را
-تشخیص دهد. سرور مقصد هنوز همان پیام درست را دریافت می‌کند و اتصال
-سالم برقرار می‌ماند.
+SNISPF-HJ بین برنامه‌ات و اینترنت می‌نشیند و آن «سلام» را یا
+**قطعه‌قطعه می‌کند** یا **یک سلام جعلی** قبل از آن می‌فرستد. سرور مقصد
+همچنان درخواست صحیح را دریافت می‌کند.
 
 ```
-┌──────────┐     ┌─────────┐     ┌─────────┐     ┌──────────────┐
-│ برنامه   ├────>│ SNISPF  ├────>│  DPI /  ├────>│ سرور واقعی   │
-│ (مرورگر، │     │ (پروکسی│     │فایروال  │     │ (مثلاً        │
-│   v2ray، │     │  محلی)  │     │         │     │  Cloudflare) │
-│  ...)    │     │         │     │         │     │              │
-└──────────┘     └─────────┘     └─────────┘     └──────────────┘
+┌──────────┐     ┌──────────────┐     ┌──────────┐     ┌──────────────┐
+│  برنامه  ├────>│  SNISPF-HJ   ├────>│  DPI /   ├────>│ سرور واقعی   │
+│ (مرورگر، │     │ (پروکسی محلی)│     │ فایروال  │     │ (Cloudflare) │
+│   v2ray، │     │              │     │          │     │              │
+│   ...)   │     │ بهترین جفت   │     │ SNI جعلی │     └──────────────┘
+└──────────┘     │ از pool انتخاب│     │ یا تکه‌تکه│
+                 └──────────────┘     └──────────┘
+```
+
+### Pool اتصال
+
+در هنگام راه‌اندازی، یک نمونهٔ تصادفی از جفت‌های `(IP، SNI)` با تست‌های TCP
+connect بررسی می‌شود. جفت‌هایی که پاسخ خوب می‌دهند وارد **pool فعال**
+می‌شوند. یک thread پس‌زمینه هر ~۳۰ ثانیه pool را دوباره بررسی می‌کند و
+جفت‌هایی که نرخ از دست دادن بسته‌هایشان از حد مجاز بیشتر شده را بیرون
+می‌کند و با جایگزین سالم‌تر عوض می‌کند. هر اتصال جدید با
+**انتخاب وزن‌دار تصادفی** یک جفت دریافت می‌کند — loss کمتر = احتمال انتخاب
+بیشتر.
+
+```
+CONNECT_IPS  ×  FAKE_SNIS  →  N × M ترکیب
+        ↓ probe (TCP connect) ↓
+   [stable]  [weak]  [dead]
+        ↓
+  Pool فعال  (ACTIVE_SLOTS بهترین جفت)
+        ↓  انتخاب وزن‌دار برای هر اتصال
+  اتصال تو  →  upstream
 ```
 
 ---
@@ -73,34 +121,38 @@ SNISPF بین برنامهٔ تو و اینترنت می‌نشیند؛ پیام
 
 ## نصب
 
-SNISPF فقط به‌صورت **سورس** توزیع می‌شود؛ هیچ Release، باینری از پیش‌ساخته
-یا ایمیج داکر منتشر نمی‌شود — نصب آن عمداً به‌سادگی یک پروژهٔ Python است.
-
-### روش ۱ — اجرا از سورس
+### روش ۱ — نصب با pip (توصیه‌شده)
 
 ```bash
-git clone https://github.com/Rainman69/SNISPF.git
-cd SNISPF
+git clone https://github.com/hjfisher/SNI-Spoofing-HJ.git
+cd SNI-Spoofing-HJ
+pip install .
+snispf-hj --info
+```
+
+یا تک‌خطی بدون کلون:
+
+```bash
+pip install git+https://github.com/hjfisher/SNI-Spoofing-HJ.git
+```
+
+> **اندروید / Termux:** اگر pip خطای سیستمی داد:
+> ```bash
+> pip install . --break-system-packages
+> ```
+
+> **نکته:** برای جلوگیری از به‌هم‌ریختن Python سیستم از محیط مجازی استفاده کن:
+> ```bash
+> python3 -m venv .venv && source .venv/bin/activate
+> ```
+
+### روش ۲ — اجرا از سورس (بدون نصب)
+
+```bash
+git clone https://github.com/hjfisher/SNI-Spoofing-HJ.git
+cd SNI-Spoofing-HJ
 python3 run.py --info
 ```
-
-### روش ۲ — نصب با pip
-
-```bash
-git clone https://github.com/Rainman69/SNISPF.git
-cd SNISPF
-pip install .
-snispf --info
-```
-
-یا تک‌خطی، بدون کلون کردن:
-
-```bash
-pip install git+https://github.com/Rainman69/SNISPF.git
-```
-
-> **نکته:** برای جلوگیری از به‌هم‌ریختن Python سیستم، از یک محیط مجازی
-> استفاده کن (`python3 -m venv .venv && source .venv/bin/activate`).
 
 ---
 
@@ -109,62 +161,94 @@ pip install git+https://github.com/Rainman69/SNISPF.git
 ### ۱. اجرای پروکسی
 
 ```bash
-# با کانفیگ پیش‌فرض موجود در ریپو
-python3 run.py --config config.json
+# با config.json پیش‌فرض (توصیه‌شده — شامل ۱۱ IP × ۳۸ SNI)
+snispf-hj --config config.json
 
-# یا کاملاً با CLI، بدون فایل کانفیگ
-python3 run.py \
+# یا با CLI، بدون pool (تک‌جفت):
+snispf-hj \
     --listen 0.0.0.0:40443 \
-    --connect 104.19.230.21:443 \
-    --sni www.hcaptcha.com \
+    --connect 172.66.41.252:443 \
+    --sni github.com \
     --method fragment
 ```
 
 باید چنین خروجی‌ای ببینی:
 
 ```
+Connection pool active — 418 pair(s), 3 active slot(s)
+Upstream selection: POOL (multi-IP / multi-SNI)
+Bypass strategy: combined
 Listening on 0.0.0.0:40443
-Forwarding to 104.19.230.21:443
-Fake SNI: www.hcaptcha.com
-Bypass strategy: fragment
+Ready! Configure your application to use:
+  Address: 127.0.0.1:40443
 ```
 
-### ۲. برنامه‌ها را به آن وصل کن
+### ۲. برنامه را وصل کن
 
-SNISPF یک «فوروردر شفاف TCP» است. در کلاینت موردنظرت (`v2ray`، `xray`،
-افزونهٔ پروکسی مرورگر، ...) به‌جای آی‌پی Cloudflare واقعی، آدرس
-**`127.0.0.1:40443`** را تنظیم کن. تنظیمات TLS و SNI واقعی روی CDN
-بدون تغییر باقی می‌مانند.
+در هر کلاینتی که استفاده می‌کنی (`v2ray`، `xray`، افزونهٔ پروکسی مرورگر، ...)
+به‌جای آی‌پی Cloudflare واقعی، آدرس **`127.0.0.1:40443`** را تنظیم کن.
 
 ---
 
 ## پیکربندی
 
-می‌توانی از فایل JSON یا فقط از CLI استفاده کنی؛ پرچم‌های خط‌فرمان همیشه
-مقادیر فایل را override می‌کنند.
-
-### ساخت کانفیگ پیش‌فرض
-
-```bash
-python3 run.py --generate-config my_config.json
-```
-
-### مرجع فایل کانفیگ
+پرچم‌های CLI همیشه مقادیر فایل کانفیگ را override می‌کنند.
 
 ```jsonc
 {
-  "LISTEN_HOST":       "0.0.0.0",
-  "LISTEN_PORT":       40443,
-  "CONNECT_IP":        "104.19.230.21",
-  "CONNECT_PORT":      443,
-  "FAKE_SNI":          "www.hcaptcha.com",
-  "BYPASS_METHOD":     "fragment",     // fragment | fake_sni | combined
-  "FRAGMENT_STRATEGY": "sni_split",
-  "FRAGMENT_DELAY":    0.1,
-  "USE_TTL_TRICK":     false,
-  "FAKE_SNI_METHOD":   "prefix_fake"
+  "LISTEN_HOST": "0.0.0.0",
+  "LISTEN_PORT": 40443,
+  "CONNECT_PORT": 443,
+  "BYPASS_METHOD": "combined",       // fragment | fake_sni | combined
+  "FRAGMENT_STRATEGY": "sni_split",  // sni_split | half | multi | tls_record_frag
+  "FRAGMENT_DELAY": 0.1,
+  "USE_TTL_TRICK": false,
+  "FAKE_SNI_METHOD": "prefix_fake",
+
+  // ── تنظیمات Pool ────────────────────────────────────────────────────
+  // حاصل‌ضرب دکارتی CONNECT_IPS × FAKE_SNIS به‌عنوان ترکیب‌ها پروب می‌شود.
+  // برای حالت تک‌جفت (بدون pool)، هر لیست را به یک عنصر محدود کن.
+
+  "ACTIVE_SLOTS": 3,                 // تعداد جفت‌های همزمان فعال
+  "HEALTH_CHECK_INTERVAL": 30,       // ثانیه بین هر دور بررسی
+  "HEALTH_CHECK_TIMEOUT": 3,         // تایم‌اوت TCP probe (ثانیه)
+  "PROBE_COUNT": 5,                  // تعداد probe در هر دور برای هر جفت
+  "LOSS_THRESHOLD": 0.20,            // نرخ loss بالاتر از این → drain
+  "DEAD_THRESHOLD": 0.80,            // نرخ loss بالاتر از این → dead
+
+  "CONNECT_IPS": [
+    "172.66.41.252",
+    "108.162.196.145"
+    // ... IP‌های بیشتر اضافه کن
+  ],
+
+  "FAKE_SNIS": [
+    "github.com",
+    "google.com",
+    "microsoft.com"
+    // ... SNI‌های بیشتر اضافه کن
+  ]
 }
 ```
+
+---
+
+## تنظیمات Pool
+
+| کلید | پیش‌فرض | توضیح |
+|---|---|---|
+| `CONNECT_IPS` | `[]` | لیست آی‌پی‌های upstream برای پروب |
+| `FAKE_SNIS` | `[]` | لیست نام‌های میزبان جعلی برای پروب |
+| `ACTIVE_SLOTS` | `3` | تعداد جفت‌های همزمان فعال |
+| `HEALTH_CHECK_INTERVAL` | `30` | ثانیه بین دورهای بررسی |
+| `HEALTH_CHECK_TIMEOUT` | `3` | تایم‌اوت TCP connect هر probe |
+| `PROBE_COUNT` | `5` | تعداد probe در هر دور |
+| `LOSS_THRESHOLD` | `0.20` | نرخ loss (۰–۱) برای drain کردن جفت |
+| `DEAD_THRESHOLD` | `0.80` | نرخ loss برای مرده اعلام کردن جفت |
+
+**حالت تک‌جفت:** اگر هر دو لیست فقط یک عنصر داشته باشند (یا از کلیدهای
+قدیمی `CONNECT_IP` / `FAKE_SNI` استفاده کنی)، pool غیرفعال می‌شود و ابزار
+در همان حالت مستقیم اصلی کار می‌کند — بدون سربار، بدون thread پس‌زمینه.
 
 ---
 
@@ -174,18 +258,18 @@ python3 run.py --generate-config my_config.json
 --config, -C FILE         مسیر فایل کانفیگ JSON
 --generate-config PATH    ساخت کانفیگ پیش‌فرض و خروج
 --listen, -l HOST:PORT    آدرس گوش‌دادن (پیش‌فرض: 0.0.0.0:40443)
---connect, -c IP:PORT     آدرس سرور مقصد
---sni,    -s HOSTNAME     نام میزبان جعلی (Fake SNI)
+--connect, -c IP:PORT     آدرس سرور مقصد (حالت تک‌جفت)
+--sni,    -s HOSTNAME     نام میزبان جعلی (حالت تک‌جفت)
 --method, -m METHOD       fragment | fake_sni | combined
 --fragment-strategy STR   sni_split | half | multi | tls_record_frag
---fragment-delay  SEC     فاصلهٔ زمانی بین قطعات
---ttl-trick               استفاده از ترفند IP TTL برای پکت‌های جعلی
+--fragment-delay  SEC     فاصله بین قطعات (ثانیه)
+--ttl-trick               فعال‌سازی ترفند IP TTL برای پکت‌های جعلی
 --no-raw                  غیرفعال‌سازی raw socket حتی اگر در دسترس باشد
---check-domains FILE      بررسی گروهی دامنه‌ها برای پشتیبانی Cloudflare
---check-workers N         تعداد ورکر برای بررسی دامنه (پیش‌فرض: 50)
---check-timeout SEC       تایم‌اوت هر دامنه (پیش‌فرض: 3.0)
---output FILE             خروجی دامنه‌های تأییدشده در فایل
---check-http              تأیید HTTP در حین بررسی دامنه
+--check-domains FILE      بررسی گروهی لیست دامنه‌ها برای Cloudflare
+--check-workers N         تعداد ورکر موازی (پیش‌فرض: ۵۰)
+--check-timeout SEC       تایم‌اوت هر دامنه (پیش‌فرض: ۳ ثانیه)
+--output FILE             ذخیرهٔ دامنه‌های تأییدشده در فایل
+--check-http              تأیید HTTP هم در حین بررسی دامنه
 --verbose, -v             لاگ کامل (debug)
 --quiet,   -q             فقط هشدارها
 --version, -V             نمایش نسخه و خروج
@@ -196,64 +280,69 @@ python3 run.py --generate-config my_config.json
 
 ## روش‌های دور زدن
 
-### `fragment` (پیش‌فرض)
+### `fragment` — کار می‌کند روی همه جا
 
-پیام TLS ClientHello را در مرز SNI به چند بخش TCP می‌شکند. DPI فقط
-بخش‌هایی از نام میزبان را می‌بیند و نمی‌تواند تصمیم بگیرد. **روی همهٔ
-پلتفرم‌ها بدون نیاز به دسترسی خاص کار می‌کند.**
+TLS ClientHello را در مرز SNI به چند بخش TCP می‌شکند. DPI فقط بخش‌هایی
+از نام میزبان را می‌بیند و نمی‌تواند تصمیم بگیرد.
+**بدون نیاز به دسترسی خاص روی هر پلتفرمی.**
+
+```bash
+snispf-hj --method fragment --config config.json
+snispf-hj --method fragment --fragment-strategy sni_split
+```
 
 ### `fake_sni`
 
-اول یک یا چند ClientHello جعلی با نام میزبان فریب می‌فرستد، بعد
-نسخهٔ واقعی را. DPI به اولین پکت اتکا می‌کند، در حالی که سرور مقصد
-هنوز نسخهٔ درست را دریافت می‌کند. روی Linux + root مؤثرتر است
-(ترفند `seq_id`). در غیر این صورت به‌طور خودکار از TTL trick استفاده
-می‌شود.
+اول یک یا چند ClientHello جعلی می‌فرستد، بعد نسخهٔ واقعی. DPI به اولین
+پکت (جعلی) قضاوت می‌کند. روی Linux + root با ترفند `seq_id` مؤثرتر است.
+در غیر این صورت به‌طور خودکار به TTL trick سوئیچ می‌کند.
 
-### `combined` (قوی‌ترین)
+### `combined` — توصیه‌شده
 
-ترکیب fragment و fake_sni. اگر فیلتر شدید است، این را امتحان کن.
+ترکیب همزمان fragmentation و fake_sni. بهترین انتخاب وقتی فیلتر تهاجمی است.
+
+```bash
+snispf-hj --method combined --config config.json
+```
 
 ---
 
-## استراتژی‌های قطعه‌قطعه کردن
+## استراتژی‌های قطعه‌بندی
 
-| استراتژی              | کار                                                          |
-|------------------------|--------------------------------------------------------------|
-| `sni_split` (پیش‌فرض) | شکستن دقیقاً روی هاست‌نیم SNI داخل ClientHello              |
-| `half`                | دو نیمهٔ تقریباً مساوی                                       |
-| `multi`               | چند قطعهٔ کوچک ۵ تا ۱۰ بایتی                                |
-| `tls_record_frag`     | شکستن در لایهٔ رکورد TLS به‌جای لایهٔ TCP                   |
+| استراتژی | کار |
+|---|---|
+| `sni_split` (پیش‌فرض) | شکستن دقیقاً روی هاست‌نیم SNI داخل ClientHello |
+| `half` | دو نیمهٔ تقریباً مساوی |
+| `multi` | چند قطعهٔ کوچک ۵ تا ۱۰ بایتی |
+| `tls_record_frag` | شکستن در لایهٔ رکورد TLS به‌جای لایهٔ TCP |
 
 ---
 
 ## بررسی‌گر دامنه
 
-SNISPF یک ابزار بررسی گروهی دارد که فهرستی از دامنه‌ها را می‌گیرد و به تو
-می‌گوید کدام‌یک پشت Cloudflare هستند تا برای **FAKE_SNI** انتخاب خوبی
-داشته باشی.
+ابزار بررسی گروهی فهرستی از دامنه‌ها می‌گیرد و می‌گوید کدام‌یک پشت
+Cloudflare هستند — مفید برای ساختن لیست `FAKE_SNIS`.
 
 ```bash
 # domains.txt: هر خط یک دامنه
-python3 run.py --check-domains domains.txt
-python3 run.py --check-domains domains.txt --output verified.txt
-python3 run.py --check-domains domains.txt --check-http -v
+snispf-hj --check-domains domains.txt
+snispf-hj --check-domains domains.txt --output verified.txt
+snispf-hj --check-domains domains.txt --check-http -v
 ```
 
 ---
 
 ## پشتیبانی از پلتفرم‌ها
 
-| پلتفرم                | وضعیت     | یادداشت                                                              |
-|------------------------|------------|----------------------------------------------------------------------|
-| Linux                  | کامل      | راو ساکت با `sudo` یا `CAP_NET_RAW` در دسترس                         |
-| macOS (Apple Silicon)  | کامل      | TTL trick خودکار فعال می‌شود                                         |
-| macOS (Intel)          | کامل      | همان رفتار macOS arm64                                               |
-| Windows 10/11          | کامل      | فقط روش‌های fragment — راو ساکت در دسترس نیست                       |
-| Android روی Termux     | پشتیبانی  | بدون نیاز به روت با fragment/combined کار می‌کند                    |
-| OpenBSD/FreeBSD        | best-effort | روش‌های fragment کار می‌کنند، راو تست نشده                          |
+| پلتفرم | وضعیت | یادداشت |
+|---|---|---|
+| Linux (هر توزیع) | ✅ کامل | raw socket با `sudo` یا `CAP_NET_RAW` |
+| macOS (Apple Silicon / Intel) | ✅ کامل | TTL trick خودکار (raw socket نیاز به root دارد) |
+| Windows 10 / 11 | ✅ کامل | fragment/combined؛ بدون raw socket |
+| Android روی Termux | ✅ پشتیبانی | بدون root؛ fragment/combined + TTL trick خودکار |
+| OpenBSD / FreeBSD | ⚡ best-effort | fragment کار می‌کند؛ raw injection تست نشده |
 
-برای دیدن قابلیت‌های دقیق سیستمت: `python3 run.py --info`.
+برای دیدن قابلیت‌های دقیق سیستمت: `snispf-hj --info`
 
 ---
 
@@ -261,20 +350,64 @@ python3 run.py --check-domains domains.txt --check-http -v
 
 **پورت اشغال است**
 ```bash
-python3 run.py -l :40444 ...
+snispf-hj --listen :40444 --config config.json
 ```
 
-**Permission denied روی پورت < ۱۰۲۴**
+**Permission denied روی پورت کمتر از ۱۰۲۴**
 از پورت ≥ 1024 استفاده کن یا با `sudo` اجرا کن.
 
+**Pool همهٔ جفت‌ها را dead نشان می‌دهد**
+- مطمئن شو `CONNECT_IPS` روی پورت ۴۴۳ در دسترس هستند.
+- `HEALTH_CHECK_TIMEOUT` را بیشتر کن: `"HEALTH_CHECK_TIMEOUT": 6`
+- `DEAD_THRESHOLD` را بالاتر ببر: `0.90`
+
 **روی بعضی سایت‌ها کار نمی‌کند**
-- `-m combined --fragment-strategy multi` را امتحان کن.
-- یک `FAKE_SNI` دیگر انتخاب کن (با `--check-domains` بررسی کن که
-  واقعاً پشت Cloudflare باشد).
-- `FRAGMENT_DELAY` را کمی بزرگ‌تر کن، مثلاً `--fragment-delay 0.25`.
+- `--method combined --fragment-strategy multi` را امتحان کن.
+- IP و SNI بیشتری به `CONNECT_IPS` / `FAKE_SNIS` اضافه کن.
+- `FRAGMENT_DELAY` را افزایش بده: `--fragment-delay 0.25`
+- با `--check-domains` تأیید کن SNI‌هایت واقعاً پشت Cloudflare هستند.
+
+**اندروید / Termux: خطای pip**
+```bash
+pip install . --break-system-packages
+```
+
+---
+
+## ساختار پروژه
+
+```
+SNISPF/
+├── run.py                        # نقطهٔ ورود (python3 run.py …)
+├── config.json                   # کانفیگ پیش‌فرض (چند-IP / چند-SNI)
+├── pyproject.toml                # متادیتا — snispf و snispf-hj
+├── README.md / README_FA.md      # مستندات (انگلیسی + فارسی)
+├── LICENSE                       # MIT
+└── sni_spoofing/
+    ├── __init__.py               # init پکیج، __version__
+    ├── cli.py                    # argparse + نقطهٔ ورود اصلی
+    ├── forwarder.py              # فوروردر async TCP + یکپارچه‌سازی pool
+    ├── pool.py                   # ★ جدید: PairStats، CombinationExplorer،
+    │                             #          ActivePool، ConnectionManager
+    ├── bypass/                   # استراتژی‌های fragment / fake-SNI / raw
+    ├── tls/                      # ساخت و تجزیهٔ ClientHello
+    ├── scanner/                  # بررسی گروهی دامنه‌های Cloudflare
+    └── utils/                    # تشخیص پلتفرم، کمک‌های IP/port
+```
+
+---
+
+## تشکر و منابع
+
+- **[@Rainman69](https://github.com/Rainman69)** — معماری اصلی SNISPF،
+  موتور fragmentation، پشتیبانی cross-platform، و CLI.
+- **[@patterniha](https://github.com/patterniha)** — ایدهٔ اولیهٔ SNI spoofing
+  و explorer ترکیب چند-IP/چند-SNI.
+- **[@hjfisher](https://github.com/hjfisher)** — `CombinationExplorer`،
+  `ActivePool`، `ConnectionManager`، و یکپارچه‌سازی pool با forwarder SNISPF.
 
 ---
 
 ## لایسنس
 
-[MIT](./LICENSE) © Rainman69
+[MIT](LICENSE) © Rainman69, hjfisher
