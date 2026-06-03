@@ -2,7 +2,7 @@
   "LISTEN_HOST": "0.0.0.0",
   "LISTEN_PORT": 40443,
   "CONNECT_PORT": 443,
-  "BYPASS_METHOD": "fragment",
+  "BYPASS_METHOD": "combined",
   "FRAGMENT_STRATEGY": "sni_split",
   "FRAGMENT_DELAY": 0.1,
   "USE_TTL_TRICK": false,
@@ -18,6 +18,16 @@
   "PROBE_COUNT": 5,
   "LOSS_THRESHOLD": 0.20,
   "DEAD_THRESHOLD": 0.80,
+
+  "_comment_discovery": "Dynamic IP discovery — scans Cloudflare CIDR ranges at runtime and injects fresh IPs into the pool.",
+  "_comment_discovery2": "Inspired by https://github.com/bia-pain-bache/Cloudflare-Clean-IP-Scanner",
+  "DYNAMIC_IP_DISCOVERY": true,
+  "DISCOVERY_BATCH": 100,
+  "DISCOVERY_INTERVAL": 120,
+  "DISCOVERY_PROBE_TRIES": 3,
+  "DISCOVERY_TIMEOUT": 2.0,
+  "DISCOVERY_MIN_SUCCESS": 0.50,
+  "DISCOVERY_MAX_IPS": 200,
 
   "CONNECT_IPS": [
     "172.66.41.252",
