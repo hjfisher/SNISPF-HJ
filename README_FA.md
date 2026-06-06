@@ -60,7 +60,9 @@
 | upstream | یک IP + یک SNI | چند IP × چند SNI |
 | بررسی سلامت | ندارد | حلقهٔ TCP probe مداوم |
 | انتخاب جفت | ثابت | وزن‌دار تصادفی |
-| جایگزینی بدون قطعی | ندارد | draining: اتصال‌های زنده تمام می‌شوند |
+| جایگزینی بدون قطعی | ندارد | draining با timeout قابل تنظیم |
+| بستن اجباری drain | ندارد | بعد از `DRAIN_TIMEOUT` ثانیه کانکشن‌ها بسته می‌شوند |
+| حذف IP های ضعیف | ندارد | ضعیف‌ترین IP ها دوره‌ای حذف می‌شوند |
 | کشف خودکار IP | ندارد | اسکن رنج‌های رسمی Cloudflare در پس‌زمینه |
 | دستور اجرا | `snispf` | `snispf` **و** `snispf-hj` |
 | ماژول‌های جدید | — | `pool.py`، `ip_discovery.py` |
@@ -97,12 +99,25 @@ SNISPF-HJ بین برنامه‌ات و اینترنت می‌نشیند و آن
 یک thread پس‌زمینه هر ~۳۰ ثانیه pool را دوباره بررسی و جفت‌های ضعیف را
 جایگزین می‌کند.
 
+### Draining با Timeout
+
+وقتی یک جفت ضعیف می‌شود وارد حالت **draining** می‌شود: اتصال جدیدی به آن
+داده نمی‌شود ولی اتصال‌های قبلی ادامه می‌دهند. بعد از `DRAIN_TIMEOUT` ثانیه
+(پیش‌فرض: ۳۰) اتصال‌های باقی‌مانده بسته می‌شوند. سقف `MAX_DRAINING` مانع
+بی‌کنترل شدن لیست draining می‌شود.
+
+### حذف IP های ضعیف (Eviction)
+
+هر `EVICT_EVERY` چرخه (پیش‌فرض: هر ۳ × ۳۰ ثانیه = ۹۰ ثانیه)، تعداد
+`EVICT_COUNT` ضعیف‌ترین IP (بر اساس میانگین نرخ loss) به‌طور دائمی از pool
+حذف می‌شوند تا جای خود را به IP های تازه‌تر بدهند. IP هایی که الان اتصال
+فعال دارند محافظت می‌شوند.
+
 ### کشف خودکار IP
 
-یک thread دوم مستقل، از رنج‌های رسمی Cloudflare (مثل `104.16.0.0/13`،
-`172.64.0.0/13`) به‌صورت تصادفی IP نمونه می‌گیرد، آن‌ها را با TCP probe
-بررسی می‌کند، و IPهای سالم را به pool تزریق می‌کند — همزمان با سرویس‌دهی
-به اتصال‌ها. به این ترتیب pool با گذشت زمان قوی‌تر می‌شود.
+یک thread دوم مستقل، از رنج‌های رسمی Cloudflare به‌صورت تصادفی IP نمونه
+می‌گیرد، آن‌ها را با TCP probe بررسی می‌کند، و IPهای سالم را به pool
+تزریق می‌کند — همزمان با سرویس‌دهی به اتصال‌ها.
 
 ```
 ۱۵ CIDR رسمی Cloudflare  →  نمونه‌گیری ۱۰۰ IP تصادفی  →  TCP probe موازی
@@ -126,8 +141,8 @@ SNISPF-HJ بین برنامه‌ات و اینترنت می‌نشیند و آن
 ### روش ۱ — pip (توصیه‌شده)
 
 ```bash
-git clone https://github.com/hjfisher/SNI-Spoofing-HJ.git
-cd SNI-Spoofing-HJ
+git clone https://github.com/hjfisher/SNISPF-HJ.git
+cd SNISPF-HJ
 pip install .
 snispf-hj --info
 ```
@@ -135,7 +150,7 @@ snispf-hj --info
 یا تک‌خطی بدون کلون:
 
 ```bash
-pip install git+https://github.com/hjfisher/SNI-Spoofing-HJ.git
+pip install git+https://github.com/hjfisher/SNISPF-HJ.git
 ```
 
 > **اندروید / Termux:**
@@ -146,8 +161,8 @@ pip install git+https://github.com/hjfisher/SNI-Spoofing-HJ.git
 ### روش ۲ — اجرا از سورس
 
 ```bash
-git clone https://github.com/hjfisher/SNI-Spoofing-HJ.git
-cd SNI-Spoofing-HJ
+git clone https://github.com/hjfisher/SNISPF-HJ.git
+cd SNISPF-HJ
 python3 run.py --info
 ```
 
@@ -156,41 +171,36 @@ python3 run.py --info
 ## ساخت فایل اجرایی (exe)
 
 با ابزار [PyInstaller](https://pyinstaller.org) می‌توانی SNISPF-HJ را به یک
-**فایل اجرایی تکی** تبدیل کنی (`.exe` روی Windows، باینری روی Linux/macOS)
-که روی هر دستگاهی بدون نصب Python اجرا می‌شود.
+**فایل اجرایی تکی** تبدیل کنی که روی هر دستگاهی بدون نصب Python اجرا می‌شود.
 
 > **مهم:** PyInstaller همیشه برای همان سیستم‌عاملی که روی آن اجرا می‌شود
-> خروجی می‌سازد. برای `.exe` باید روی Windows build کنی. برای باینری Linux
-> باید روی Linux build کنی. Cross-compile پشتیبانی نمی‌شود.
+> خروجی می‌سازد. برای `.exe` باید روی Windows و برای باینری Linux باید روی
+> Linux build کنی.
 
 ### مرحله ۱ — نصب PyInstaller
 
 ```bash
 pip install pyinstaller
-```
-
-اگر روی **Windows PowerShell** دستور شناخته نشد:
-```powershell
+# اگر روی Windows PowerShell شناخته نشد:
 python -m pip install pyinstaller
 ```
 
 ### مرحله ۲ — ساخت
 
 ```bash
-# از داخل پوشه پروژه:
-cd SNI-Spoofing-HJ
+cd SNISPF-HJ
 
 # فایل اجرایی تکی (توصیه‌شده)
 python -m PyInstaller --onefile --name snispf-hj run.py
 
-# همراه با config.json داخل فایل exe:
+# همراه با config.json:
 # Windows:
 python -m PyInstaller --onefile --name snispf-hj --add-data "config.json;." run.py
 # Linux / macOS:
 python -m PyInstaller --onefile --name snispf-hj --add-data "config.json:." run.py
 ```
 
-خروجی در پوشه `dist/` ساخته می‌شود:
+خروجی در پوشه `dist/`:
 
 ```
 dist/
@@ -204,21 +214,15 @@ dist/
 # Windows
 dist\snispf-hj.exe --config config.json
 ```
-
 ```bash
 # Linux / macOS
-chmod +x dist/snispf-hj
-./dist/snispf-hj --config config.json
+chmod +x dist/snispf-hj && ./dist/snispf-hj --config config.json
 ```
 
-### نکات
-
+**نکات:**
 - اگر `config.json` داخل exe نبود، آن را کنار فایل اجرایی قرار بده.
-- `--onefile` یک فایل portable می‌سازد ولی اولین اجرا کمی کندتر است (فایل
-  را در یک پوشه موقت باز می‌کند). بدون `--onefile` یک پوشه `dist/snispf-hj/`
-  ساخته می‌شود که اجرا سریع‌تر است.
-- آنتی‌ویروس‌های Windows گاهی فایل‌های PyInstaller را مشکوک می‌شناسند. این
-  یک false positive شناخته‌شده است — کد سورس کاملاً باز است.
+- آنتی‌ویروس‌های Windows گاهی فایل‌های PyInstaller را مشکوک می‌شناسند — این
+  یک false positive شناخته‌شده است.
 
 ---
 
@@ -244,8 +248,7 @@ Ready! Configure your application to use:
   Address: 127.0.0.1:40443
 ```
 
-کلاینت خود (`v2ray`، `xray`، افزونه پروکسی مرورگر، ...) را روی
-**`127.0.0.1:40443`** تنظیم کن.
+کلاینت خود را روی **`127.0.0.1:40443`** تنظیم کن.
 
 ---
 
@@ -258,8 +261,8 @@ Ready! Configure your application to use:
   "LISTEN_HOST": "0.0.0.0",
   "LISTEN_PORT": 40443,
   "CONNECT_PORT": 443,
-  "BYPASS_METHOD": "combined",       // fragment | fake_sni | combined
-  "FRAGMENT_STRATEGY": "sni_split",  // sni_split | half | multi | tls_record_frag
+  "BYPASS_METHOD": "combined",
+  "FRAGMENT_STRATEGY": "sni_split",
   "FRAGMENT_DELAY": 0.1,
   "USE_TTL_TRICK": false,
   "FAKE_SNI_METHOD": "prefix_fake",
@@ -271,6 +274,10 @@ Ready! Configure your application to use:
   "PROBE_COUNT": 5,
   "LOSS_THRESHOLD": 0.20,
   "DEAD_THRESHOLD": 0.80,
+  "DRAIN_TIMEOUT": 30,
+  "MAX_DRAINING": 5,
+  "EVICT_EVERY": 3,
+  "EVICT_COUNT": 2,
 
   "CONNECT_IPS": ["172.66.41.252", "108.162.196.145"],
   "FAKE_SNIS": ["github.com", "google.com"],
@@ -300,9 +307,16 @@ Ready! Configure your application to use:
 | `PROBE_COUNT` | `5` | تعداد probe در هر دور |
 | `LOSS_THRESHOLD` | `0.20` | نرخ loss برای drain کردن جفت |
 | `DEAD_THRESHOLD` | `0.80` | نرخ loss برای مرده اعلام کردن جفت |
+| `DRAIN_TIMEOUT` | `30` | ثانیه تا بستن اجباری کانکشن‌های draining |
+| `MAX_DRAINING` | `5` | حداکثر جفت‌های همزمان در draining؛ قدیمی‌ترین force-close می‌شود |
+| `EVICT_EVERY` | `3` | هر چند چرخه یک‌بار eviction اجرا شود |
+| `EVICT_COUNT` | `2` | تعداد IP حذف‌شده در هر دور eviction |
 
 **حالت تک‌جفت:** اگر هر دو لیست فقط یک عنصر داشته باشند، pool غیرفعال
-می‌شود و ابزار در حالت مستقیم اصلی کار می‌کند.
+می‌شود و ابزار در حالت مستقیم کار می‌کند.
+
+**مثال زمان‌بندی eviction:** با `HEALTH_CHECK_INTERVAL=30`، `EVICT_EVERY=3`،
+`EVICT_COUNT=2` → هر ۹۰ ثانیه ۲ تا از ضعیف‌ترین IP ها حذف و جایگزین می‌شوند.
 
 ---
 
@@ -318,9 +332,8 @@ Ready! Configure your application to use:
 | `DISCOVERY_MIN_SUCCESS` | `0.50` | حداقل نرخ موفقیت برای پذیرش IP (۰–۱) |
 | `DISCOVERY_MAX_IPS` | `200` | سقف تعداد IPهای داینامیک |
 
-اولین اسکن ۱۵ ثانیه بعد از راه‌اندازی شروع می‌شود تا pool اول bootstrap
-شود. تمام عملیات در یک daemon thread اجرا می‌شود و هیچ اتصال فعالی را
-قطع نمی‌کند.
+اولین اسکن ۱۵ ثانیه بعد از راه‌اندازی شروع می‌شود. تمام عملیات در daemon
+thread اجرا می‌شود و هیچ اتصال فعالی را قطع نمی‌کند.
 
 ---
 
@@ -414,9 +427,13 @@ python -m PyInstaller --onefile --name snispf-hj run.py
 - `HEALTH_CHECK_TIMEOUT` را به `6` افزایش بده.
 - `DEAD_THRESHOLD` را به `0.90` افزایش بده.
 
-**Discovery هیچ IP‌ای پیدا نمی‌کند**
-- شبکه‌ات ممکن است probe‌های خروجی را بلاک کند — `DISCOVERY_TIMEOUT: 4.0` را امتحان کن.
-- `DISCOVERY_MIN_SUCCESS: 0.34` برای آستانه شل‌تر.
+**کانکشن‌ها به‌طور غیرمنتظره بسته می‌شوند**
+- احتمالاً `DRAIN_TIMEOUT` فعال شده — مقدار را بیشتر کن: `"DRAIN_TIMEOUT": 60`
+- یا `EVICT_COUNT` را به `1` کاهش بده تا rotation کندتر باشد.
+
+**Discovery هیچ IP ای پیدا نمی‌کند**
+- `DISCOVERY_TIMEOUT` را افزایش بده: `4.0`
+- آستانه را شل‌تر کن: `"DISCOVERY_MIN_SUCCESS": 0.34`
 
 **روی بعضی سایت‌ها کار نمی‌کند**
 - `--method combined --fragment-strategy multi` را امتحان کن.
@@ -434,7 +451,7 @@ pip install . --break-system-packages
 ## ساختار پروژه
 
 ```
-SNISPF/
+SNISPF-HJ/
 ├── run.py                        # نقطهٔ ورود (python3 run.py …)
 ├── config.json                   # کانفیگ پیش‌فرض
 ├── pyproject.toml                # متادیتا — snispf و snispf-hj
@@ -461,7 +478,8 @@ SNISPF/
 - **[@patterniha](https://github.com/patterniha)** — ایدهٔ اولیهٔ SNI spoofing
   و explorer ترکیب چند-IP/چند-SNI.
 - **[@hjfisher](https://github.com/hjfisher)** — `CombinationExplorer`،
-  `ActivePool`، `ConnectionManager`، `IPDiscovery`، و یکپارچه‌سازی با SNISPF.
+  `ActivePool`، `ConnectionManager`، `IPDiscovery`، drain timeout، IP eviction،
+  و یکپارچه‌سازی با SNISPF.
 - **[@bia-pain-bache](https://github.com/bia-pain-bache)** و
   **[@Ptechgithub](https://github.com/Ptechgithub)** — روش اسکن IP Cloudflare
   که الهام‌بخش `ip_discovery.py` بود.
