@@ -18,6 +18,10 @@
   "PROBE_COUNT": 5,
   "LOSS_THRESHOLD": 0.20,
   "DEAD_THRESHOLD": 0.80,
+  "DRAIN_TIMEOUT": 30,
+  "MAX_DRAINING": 5,
+  "EVICT_EVERY": 3,
+  "EVICT_COUNT": 5,
 
   "_comment_discovery": "Dynamic IP discovery — scans Cloudflare CIDR ranges at runtime and injects fresh IPs into the pool.",
   "_comment_discovery2": "Inspired by https://github.com/bia-pain-bache/Cloudflare-Clean-IP-Scanner",
