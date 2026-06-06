@@ -284,12 +284,9 @@ async def handle_connection(
                     await loop.sock_sendall(s_out, data)
                     # Record success only when we get the first
                     # response from the server (S->C direction).
-                    # This proves the connection is actually working
-                    # and the server accepted our ClientHello.
                     if label == "S->C" and not server_responded:
                         server_responded = True
                         _conn_tracker.record_success(active_ip)
-                        # Also record a successful real packet for the pool.
                         if pair is not None:
                             pair.record_real_packet(lost=False)
             except (ConnectionResetError, BrokenPipeError, OSError):
@@ -299,14 +296,43 @@ async def handle_connection(
             finally:
                 done.set()
 
+        # Watcher: fires when the pool drain-timeout expires for this pair.
+        # Closes both sockets so the relay tasks exit cleanly.
+        async def _drain_watcher():
+            if pair is None:
+                return
+            ev = pair.force_close_event
+            # Poll cheaply; the event is set at most once per pair lifetime.
+            while not done.is_set():
+                if ev.is_set():
+                    logger.debug(
+                        "Drain timeout reached for %s — closing connection "
+                        "from %s:%s",
+                        pair.ip, incoming_addr[0], incoming_addr[1],
+                    )
+                    try:
+                        incoming_sock.close()
+                    except Exception:
+                        pass
+                    try:
+                        if outgoing_sock:
+                            outgoing_sock.close()
+                    except Exception:
+                        pass
+                    done.set()
+                    return
+                await asyncio.sleep(0.5)
+
         c2s_task = loop.create_task(_relay(incoming_sock, outgoing_sock, "C->S"))
         s2c_task = loop.create_task(_relay(outgoing_sock, incoming_sock, "S->C"))
+        watcher_task = loop.create_task(_drain_watcher())
 
-        # Wait until one direction closes, then cancel the other
+        # Wait until one direction closes, then cancel the others.
         await done.wait()
         c2s_task.cancel()
         s2c_task.cancel()
-        await asyncio.gather(c2s_task, s2c_task, return_exceptions=True)
+        watcher_task.cancel()
+        await asyncio.gather(c2s_task, s2c_task, watcher_task, return_exceptions=True)
 
         # If the server never responded, record a failure.
         # This catches cases where DPI allows the handshake but
