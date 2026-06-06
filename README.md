@@ -10,8 +10,6 @@
  /  \ ||  |  | |  |/  \ ||  |  |   _]|_____||  |  /  |  |
  \    ||  |  | |  |\    ||  |  |  |         |  |  \  `  |
   \___||__|__||____|\___||__|  |__|         |__|__|\____j
-                                                         
-                                                    
 ```
 
 **[FA README | توضیحات فارسی](README_FA.md)**
@@ -61,7 +59,9 @@ Any idea? → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discuss
 | Upstream targets | Single IP + single SNI | Multiple IPs × multiple SNIs |
 | Health checking | None | Continuous TCP probe loop |
 | Pair selection | Static | Weighted-random (lower loss = higher chance) |
-| Graceful rotation | No | Draining: live connections finish, weak pairs replaced |
+| Graceful rotation | No | Draining with configurable timeout |
+| Forced drain close | No | Connections closed after `DRAIN_TIMEOUT` seconds |
+| IP eviction | No | Weakest IPs periodically removed from pool |
 | Dynamic IP discovery | No | Scans Cloudflare CIDR ranges at runtime |
 | Entry point | `snispf` | `snispf` **and** `snispf-hj` |
 | Config keys | `CONNECT_IP`, `FAKE_SNI` | `CONNECT_IPS` (list), `FAKE_SNIS` (list) |
@@ -102,13 +102,27 @@ every ~30 seconds and rotates out degraded pairs. Each new connection is
 assigned a pair using **weighted-random selection** (lower loss = higher
 probability).
 
+### Draining with Timeout
+
+When a pair degrades it enters **draining** mode: no new connections are
+assigned to it, but existing ones keep running. After `DRAIN_TIMEOUT` seconds
+(default: 30) any remaining connections on that pair are forcefully closed so
+the pair can be fully retired. A cap of `MAX_DRAINING` pairs prevents the
+draining list from growing out of control.
+
+### IP Eviction
+
+Every `EVICT_EVERY` health cycles (default: every 3 × 30 s = 90 s), the
+`EVICT_COUNT` weakest IPs (by average loss rate) are permanently removed from
+the pool, making room for fresh IPs found by the discovery thread. IPs that
+are currently serving active connections are protected from eviction.
+
 ### Dynamic IP Discovery
 
 A second background thread continuously samples random IPs from Cloudflare's
 official CIDR ranges (e.g. `104.16.0.0/13`, `172.64.0.0/13`, …), probes them
 with TCP connects, and injects the healthy ones into the pool — all while the
-proxy is serving connections. This means the pool grows stronger over time
-without any manual IP hunting.
+proxy is serving connections.
 
 ```
 15 Cloudflare CIDRs  →  sample 100 random IPs  →  TCP probe (parallel)
@@ -132,8 +146,8 @@ without any manual IP hunting.
 ### Option 1 — pip (recommended)
 
 ```bash
-git clone https://github.com/hjfisher/SNI-Spoofing-HJ.git
-cd SNI-Spoofing-HJ
+git clone https://github.com/hjfisher/SNISPF-HJ.git
+cd SNISPF-HJ
 pip install .
 snispf-hj --info
 ```
@@ -141,7 +155,7 @@ snispf-hj --info
 Or without cloning:
 
 ```bash
-pip install git+https://github.com/hjfisher/SNI-Spoofing-HJ.git
+pip install git+https://github.com/hjfisher/SNISPF-HJ.git
 ```
 
 > **Android / Termux:**
@@ -152,8 +166,8 @@ pip install git+https://github.com/hjfisher/SNI-Spoofing-HJ.git
 ### Option 2 — Run from source
 
 ```bash
-git clone https://github.com/hjfisher/SNI-Spoofing-HJ.git
-cd SNI-Spoofing-HJ
+git clone https://github.com/hjfisher/SNISPF-HJ.git
+cd SNISPF-HJ
 python3 run.py --info
 ```
 
@@ -163,38 +177,37 @@ python3 run.py --info
 
 You can package SNISPF-HJ into a **single executable file** (`.exe` on
 Windows, a plain binary on Linux/macOS) using
-[PyInstaller](https://pyinstaller.org).  The resulting file can be copied to
-any machine and run without Python installed.
+[PyInstaller](https://pyinstaller.org). The resulting file runs on any machine
+without Python installed.
 
-> **Important:** PyInstaller always builds for the OS it runs on.  To get a
-> `.exe` you must run the build on Windows.  To get a Linux binary, build on
-> Linux.  Cross-compilation is not supported.
+> **Important:** PyInstaller always builds for the OS it runs on. To get a
+> `.exe` build on Windows; for a Linux binary build on Linux.
+> Cross-compilation is not supported.
 
 ### Step 1 — Install PyInstaller
 
 ```bash
 pip install pyinstaller
-# If the above doesn't work on Windows PowerShell:
+# If not recognized on Windows PowerShell:
 python -m pip install pyinstaller
 ```
 
 ### Step 2 — Build
 
 ```bash
-# From inside the project folder:
-cd SNI-Spoofing-HJ
+cd SNISPF-HJ
 
 # Single-file executable (recommended)
 python -m PyInstaller --onefile --name snispf-hj run.py
 
-# Also bundle config.json into the executable
+# Bundle config.json inside the executable:
 # Windows:
 python -m PyInstaller --onefile --name snispf-hj --add-data "config.json;." run.py
 # Linux / macOS:
 python -m PyInstaller --onefile --name snispf-hj --add-data "config.json:." run.py
 ```
 
-The output will be in the `dist/` folder:
+Output in `dist/`:
 
 ```
 dist/
@@ -204,31 +217,28 @@ dist/
 
 ### Step 3 — Run
 
-```bash
+```powershell
 # Windows
 dist\snispf-hj.exe --config config.json
-
+```
+```bash
 # Linux / macOS
-chmod +x dist/snispf-hj
-./dist/snispf-hj --config config.json
+chmod +x dist/snispf-hj && ./dist/snispf-hj --config config.json
 ```
 
-### Notes
-
-- If `config.json` was **not** bundled into the exe, place it next to the
-  executable before running.
-- The `--onefile` flag produces one portable file but makes startup slightly
-  slower (it extracts itself to a temp dir on first run).  Omit it for faster
-  startup at the cost of a `dist/snispf-hj/` folder instead of a single file.
-- On Windows, antivirus software sometimes flags PyInstaller executables as
-  suspicious.  This is a known false positive — the source code is fully open.
+**Notes:**
+- If `config.json` was not bundled, place it next to the executable.
+- `--onefile` is portable but slightly slower on first launch (extracts to a
+  temp dir). Omit it for a `dist/snispf-hj/` folder with faster startup.
+- Windows antivirus may flag PyInstaller outputs as suspicious — this is a
+  known false positive; the source code is fully open.
 
 ---
 
 ## Quick Start
 
 ```bash
-# With bundled config (multi-IP / multi-SNI pool + dynamic discovery)
+# Multi-IP / multi-SNI pool + dynamic discovery
 snispf-hj --config config.json
 
 # Single-pair mode (no pool)
@@ -274,6 +284,10 @@ CLI flags override config file values.
   "PROBE_COUNT": 5,
   "LOSS_THRESHOLD": 0.20,
   "DEAD_THRESHOLD": 0.80,
+  "DRAIN_TIMEOUT": 30,
+  "MAX_DRAINING": 5,
+  "EVICT_EVERY": 3,
+  "EVICT_COUNT": 2,
 
   "CONNECT_IPS": [
     "172.66.41.252",
@@ -311,10 +325,18 @@ CLI flags override config file values.
 | `PROBE_COUNT` | `5` | TCP probes per pair per cycle |
 | `LOSS_THRESHOLD` | `0.20` | Loss rate above which a pair is drained |
 | `DEAD_THRESHOLD` | `0.80` | Loss rate above which a pair is marked dead |
+| `DRAIN_TIMEOUT` | `30` | Seconds before a draining pair's connections are force-closed |
+| `MAX_DRAINING` | `5` | Max simultaneous draining pairs; oldest is force-closed if exceeded |
+| `EVICT_EVERY` | `3` | Evict weakest IPs every N health cycles |
+| `EVICT_COUNT` | `2` | Number of IPs to evict per eviction cycle |
 
 **Single-pair mode:** if both lists have exactly one entry (or legacy
 `CONNECT_IP` / `FAKE_SNI` keys are used), the pool is disabled and the tool
 runs in direct mode with no overhead.
+
+**Eviction timing example:** with `HEALTH_CHECK_INTERVAL=30`, `EVICT_EVERY=3`,
+`EVICT_COUNT=2` → every 90 seconds the 2 weakest IPs are removed and replaced
+by fresh ones from the discovery thread.
 
 ---
 
@@ -331,8 +353,8 @@ runs in direct mode with no overhead.
 | `DISCOVERY_MAX_IPS` | `200` | Cap on dynamically discovered IPs |
 
 Discovery samples from Cloudflare's official IP ranges and only accepts IPs
-that pass the TCP probe threshold.  All logic runs in a daemon thread and never
-interrupts live connections.  The first scan starts 15 seconds after launch to
+that pass the TCP probe threshold. All logic runs in a daemon thread and never
+interrupts live connections. The first scan starts 15 seconds after launch to
 let the pool bootstrap first.
 
 ---
@@ -427,9 +449,13 @@ python -m PyInstaller --onefile --name snispf-hj run.py
 - Raise `HEALTH_CHECK_TIMEOUT` to `6`.
 - Raise `DEAD_THRESHOLD` to `0.90`.
 
+**Connections getting closed unexpectedly**
+- This may be `DRAIN_TIMEOUT` firing. Raise it: `"DRAIN_TIMEOUT": 60`.
+- Or reduce `EVICT_COUNT` to `1` to slow down IP rotation.
+
 **Discovery finds nothing**
-- Your network may block outbound probes — try `DISCOVERY_TIMEOUT: 4.0`.
-- Set `DISCOVERY_MIN_SUCCESS: 0.34` for a looser threshold.
+- Your network may block outbound probes — try `"DISCOVERY_TIMEOUT": 4.0`.
+- Loosen the threshold: `"DISCOVERY_MIN_SUCCESS": 0.34`.
 
 **Bypass doesn't work for some sites**
 - Try `--method combined --fragment-strategy multi`.
@@ -447,7 +473,7 @@ pip install . --break-system-packages
 ## Project Structure
 
 ```
-SNISPF/
+SNISPF-HJ/
 ├── run.py                        # Entry point (python3 run.py …)
 ├── config.json                   # Default config
 ├── pyproject.toml                # Package — exports snispf + snispf-hj
@@ -474,7 +500,8 @@ SNISPF/
 - **[@patterniha](https://github.com/patterniha)** — original SNI-spoofing concept
   and the multi-IP/SNI combination explorer idea.
 - **[@hjfisher](https://github.com/hjfisher)** — `CombinationExplorer`,
-  `ActivePool`, `ConnectionManager`, `IPDiscovery`, and pool integration.
+  `ActivePool`, `ConnectionManager`, `IPDiscovery`, drain timeout, IP eviction,
+  and pool integration.
 - **[@bia-pain-bache](https://github.com/bia-pain-bache)** and
   **[@Ptechgithub](https://github.com/Ptechgithub)** — Cloudflare IP scanning
   methodology that inspired `ip_discovery.py`.
