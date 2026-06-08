@@ -310,16 +310,30 @@ class CombinationExplorer:
     # ------------------------------------------------------------------
 
     def _probe_one(self, ps: PairStats) -> None:
+        """Probe one (IP, SNI) pair with a real TLS handshake.
+
+        Uses the pair's own SNI so the test reflects exactly what the
+        forwarder will send — not just whether the TCP port is open.
+        Certificate validation is disabled because we are testing
+        reachability, not cert validity.
+        """
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
         count = max(2, self.probe_count + random.randint(-1, 1))
         for _ in range(count):
+            success = False
             try:
-                sock = socket.create_connection(
+                with socket.create_connection(
                     (ps.ip, self.port), timeout=self.timeout
-                )
-                sock.close()
-                ps.record_probe(success=True, dead_threshold=self.dead_threshold)
+                ) as raw:
+                    with ctx.wrap_socket(raw, server_hostname=ps.sni):
+                        success = True
             except Exception:
-                ps.record_probe(success=False, dead_threshold=self.dead_threshold)
+                pass
+            ps.record_probe(success=success, dead_threshold=self.dead_threshold)
             time.sleep(random.uniform(0.05, 0.2))
 
     def _run_probes_parallel(self, pairs: List[PairStats]) -> None:
