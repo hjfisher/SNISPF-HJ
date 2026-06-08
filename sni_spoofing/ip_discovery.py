@@ -134,23 +134,37 @@ def sample_cloudflare_ips(total: int, cidrs: Optional[List[str]] = None) -> List
 
 
 # ---------------------------------------------------------------------------
-# TCP reachability probe (mirrors tcping.go)
+# TLS reachability probe
 # ---------------------------------------------------------------------------
 
-def _tcp_probe(ip: str, port: int, timeout: float, attempts: int) -> float:
-    """Return the fraction of successful TCP connects (0.0 – 1.0).
+def _tls_probe(ip: str, port: int, timeout: float, attempts: int) -> float:
+    """Return the fraction of successful TLS handshakes (0.0 – 1.0).
 
-    A result ≥ 0.5 is considered reachable.  We mirror the CloudflareScanner
-    approach: multiple short connect attempts, count successes.
+    Unlike a plain TCP connect, this actually completes a TLS handshake
+    (ClientHello → ServerHello) which proves the server is genuinely
+    accepting and responding to TLS traffic on the given port — not just
+    that the TCP port is open.
+
+    SNI is set to ``cloudflare.com`` (a safe, always-valid Cloudflare host)
+    so the server can route the handshake correctly.  Certificate validation
+    is disabled because we are testing IP reachability, not cert validity.
     """
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
     successes = 0
     for _ in range(attempts):
         try:
-            with socket.create_connection((ip, port), timeout=timeout):
-                successes += 1
-        except OSError:
+            with socket.create_connection((ip, port), timeout=timeout) as raw:
+                with ctx.wrap_socket(raw, server_hostname="cloudflare.com") as tls:
+                    # ServerHello received — IP is genuinely serving TLS.
+                    _ = tls.version()
+                    successes += 1
+        except Exception:
             pass
-        # Small gap to avoid overwhelming the host.
         time.sleep(random.uniform(0.02, 0.08))
     return successes / attempts
 
@@ -293,7 +307,7 @@ class IPDiscovery:
         lock = threading.Lock()
 
         def _probe_one(ip: str) -> None:
-            rate = _tcp_probe(
+            rate = _tls_probe(
                 ip, self.port, self.probe_timeout, self.probe_attempts
             )
             if rate >= self.min_success_rate:
