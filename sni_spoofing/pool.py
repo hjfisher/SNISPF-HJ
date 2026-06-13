@@ -73,6 +73,9 @@ class PairStats:
     """
 
     MIN_PROBES: int = 3
+    # Worst-case latency cap for normalisation (ms).
+    # Pairs above this are treated as maximally slow (latency_score = 1.0).
+    LATENCY_CAP_MS: float = 1500.0
 
     def __init__(self, ip: str, sni: str) -> None:
         self.ip: str = ip
@@ -82,6 +85,12 @@ class PairStats:
         self.probes_recv: int = 0
         self.real_packets_sent: int = 0
         self.real_packets_lost: int = 0
+
+        # Latency tracking — rolling average of TLS handshake time (ms).
+        # Only successful probes contribute; failed ones are excluded so a
+        # 3000 ms timeout doesn't artificially inflate the average.
+        self._latency_sum_ms: float = 0.0
+        self._latency_count: int = 0
 
         self.active_connections: int = 0
         self.total_connections: int = 0
@@ -119,13 +128,46 @@ class PairStats:
         return self.probe_loss_rate
 
     @property
+    def avg_latency_ms(self) -> float:
+        """Average TLS handshake latency across successful probes (ms).
+
+        Returns LATENCY_CAP_MS when no successful probe has been recorded
+        yet, so unknown pairs are treated as slow rather than fast — this
+        prevents them from jumping to the top of the pool before being tested.
+        """
+        if self._latency_count == 0:
+            return self.LATENCY_CAP_MS
+        return self._latency_sum_ms / self._latency_count
+
+    @property
+    def latency_score(self) -> float:
+        """Normalised latency score in [0, 1].  0 = fastest, 1 = slowest.
+
+        Capped at LATENCY_CAP_MS so extreme outliers don't dominate.
+        """
+        return min(self.avg_latency_ms, self.LATENCY_CAP_MS) / self.LATENCY_CAP_MS
+
+    @property
     def score(self) -> float:
-        """Lower is better.  Dead → +inf.  Unknown → 0.5."""
+        """Composite score — lower is better.
+
+        Weights:
+          60 % combined loss rate  (main quality signal)
+          20 % latency score       (TLS handshake speed)
+          20 % probe loss rate     (raw probe health)
+
+        Dead  → +inf  (never selected)
+        Unknown (not yet probed) → 0.5  (given a fair chance)
+        """
         if not self.alive:
             return float("inf")
         if not self.probed:
             return 0.5
-        return self.combined_loss_rate
+        return (
+            0.60 * self.combined_loss_rate
+            + 0.20 * self.latency_score
+            + 0.20 * self.probe_loss_rate
+        )
 
     @property
     def is_stable(self) -> bool:
@@ -135,13 +177,28 @@ class PairStats:
     # Mutation helpers (thread-safe)
     # ------------------------------------------------------------------
 
-    def record_probe(self, success: bool, dead_threshold: float = 0.80) -> None:
-        """Update probe counters and flip ``alive`` if needed."""
+    def record_probe(
+        self,
+        success: bool,
+        dead_threshold: float = 0.80,
+        latency_ms: float = 0.0,
+    ) -> None:
+        """Update probe counters and flip ``alive`` if needed.
+
+        Args:
+            success:       Whether the TLS handshake succeeded.
+            dead_threshold: Loss rate above which the pair is marked dead.
+            latency_ms:    TLS handshake duration in milliseconds.
+                           Only recorded when success=True.
+        """
         with self.lock:
             self.probes_sent += 1
             self.probed = True
             if success:
                 self.probes_recv += 1
+                # Rolling average — only successful probes contribute.
+                self._latency_sum_ms += latency_ms
+                self._latency_count += 1
             if self.probes_sent >= self.MIN_PROBES:
                 loss = (self.probes_sent - self.probes_recv) / self.probes_sent
                 if loss >= dead_threshold:
@@ -312,10 +369,11 @@ class CombinationExplorer:
     def _probe_one(self, ps: PairStats) -> None:
         """Probe one (IP, SNI) pair with a real TLS handshake.
 
+        Measures the wall-clock time of the TLS handshake and records it
+        as latency so the score reflects both loss rate and connection speed.
         Uses the pair's own SNI so the test reflects exactly what the
-        forwarder will send — not just whether the TCP port is open.
-        Certificate validation is disabled because we are testing
-        reachability, not cert validity.
+        forwarder will send.  Certificate validation is disabled because we
+        are testing reachability, not cert validity.
         """
         import ssl
         ctx = ssl.create_default_context()
@@ -325,15 +383,22 @@ class CombinationExplorer:
         count = max(2, self.probe_count + random.randint(-1, 1))
         for _ in range(count):
             success = False
+            latency_ms = 0.0
             try:
+                t0 = time.monotonic()
                 with socket.create_connection(
                     (ps.ip, self.port), timeout=self.timeout
                 ) as raw:
                     with ctx.wrap_socket(raw, server_hostname=ps.sni):
+                        latency_ms = (time.monotonic() - t0) * 1000
                         success = True
             except Exception:
                 pass
-            ps.record_probe(success=success, dead_threshold=self.dead_threshold)
+            ps.record_probe(
+                success=success,
+                dead_threshold=self.dead_threshold,
+                latency_ms=latency_ms,
+            )
             time.sleep(random.uniform(0.05, 0.2))
 
     def _run_probes_parallel(self, pairs: List[PairStats]) -> None:
@@ -407,9 +472,11 @@ class CombinationExplorer:
         for ps in sorted(stable, key=lambda x: x.score)[: 8]:
             marker = "*" if ps.in_active_pool else " "
             logger.info(
-                "  %s %-20s %-25s  loss=%.1f%%  active=%d",
+                "  %s %-20s %-25s  loss=%.1f%%  latency=%dms  score=%.3f  active=%d",
                 marker, ps.ip, ps.sni,
                 ps.combined_loss_rate * 100,
+                int(ps.avg_latency_ms),
+                ps.score,
                 ps.active_connections,
             )
 
