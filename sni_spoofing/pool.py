@@ -19,18 +19,30 @@ This module ports the core ideas from SNI-Spoofing-HJ (by @hjfisher /
 
 Key behaviours added vs. the original design
 --------------------------------------------
-1. **Eviction** — every EVICT_EVERY health cycles the weakest IP (across
-   *all* pairs, static + dynamic) is removed from the stats dict entirely.
-   Pairs with higher loss rates are evicted first, giving the dynamic
-   discovery thread room to replace them with fresher IPs.
+1. **Eviction with quarantine** — every EVICT_EVERY health cycles the
+   weakest IP (across *all* pairs, static + dynamic) is moved out of the
+   active stats dict into a quarantine list rather than being discarded
+   forever. Pairs with higher loss rates are evicted first, giving the
+   dynamic discovery thread room to inject fresher IPs.
 
-2. **Drain timeout** — when a pair enters draining its ``drain_started_at``
-   timestamp is recorded.  After ``DRAIN_TIMEOUT`` seconds the pair's
-   ``force_close_event`` is set.  The forwarder watches that event inside
+2. **Recycling** — every RECYCLE_EVERY health cycles, a random sample of
+   quarantined IPs is re-probed. An IP that now passes the health check is
+   restored to the active stats dict with brand-new PairStats objects (no
+   memory of its prior failures), giving it a genuinely fresh chance.
+
+3. **EMA-based loss tracking** — probe loss and real-traffic loss are each
+   tracked as an exponential moving average rather than a cumulative
+   counter. This means a pair that was unhealthy and has since recovered
+   will see its score improve as fresh good results arrive, instead of
+   being permanently weighed down by old failures.
+
+4. **Drain timeout** — when a pair enters draining its ``drain_started_at``
+   timestamp is recorded. After ``DRAIN_TIMEOUT`` seconds the pair's
+   ``force_close_event`` is set. The forwarder watches that event inside
    the relay loop and closes the sockets as soon as it fires.
 
-3. **Drain cap** — at most ``MAX_DRAINING`` pairs can be draining
-   simultaneously.  If a new pair would exceed the cap the oldest draining
+5. **Drain cap** — at most ``MAX_DRAINING`` pairs can be draining
+   simultaneously. If a new pair would exceed the cap the oldest draining
    pair is force-closed immediately.
 """
 
@@ -77,14 +89,36 @@ class PairStats:
     # Pairs above this are treated as maximally slow (latency_score = 1.0).
     LATENCY_CAP_MS: float = 1500.0
 
-    def __init__(self, ip: str, sni: str) -> None:
+    # EMA smoothing factors. Higher alpha = faster reaction to recent
+    # results, lower alpha = longer memory / more stable.
+    # Probes arrive on a fixed schedule (~every health cycle) so a
+    # moderate alpha keeps the score responsive.  Real-traffic packets can
+    # arrive in bursts (many connections at once), so a smaller alpha keeps
+    # one bad burst from dominating the score.
+    EMA_ALPHA_PROBE: float = 0.25
+    EMA_ALPHA_REAL: float = 0.15
+
+    def __init__(self, ip: str, sni: str, origin: str = "static") -> None:
         self.ip: str = ip
         self.sni: str = sni
+        # Where this pair's IP came from:
+        #   "static"  — listed in CONNECT_IPS in the config file
+        #   "dynamic" — found at runtime by the IP discovery scanner
+        # Used to scope eviction/quarantine/recycling to one source or both.
+        self.origin: str = origin
 
         self.probes_sent: int = 0
         self.probes_recv: int = 0
         self.real_packets_sent: int = 0
         self.real_packets_lost: int = 0
+
+        # Exponential moving averages of loss (0.0 = perfect, 1.0 = total
+        # loss).  Unlike raw cumulative counters these naturally "forget"
+        # old results — if a pair was bad and then recovers, its EMA will
+        # drift back down as fresh successful probes/packets arrive,
+        # instead of being permanently weighed down by old failures.
+        self.ema_probe_loss: float = 0.0
+        self.ema_real_loss: float = 0.0
 
         # Latency tracking — rolling average of TLS handshake time (ms).
         # Only successful probes contribute; failed ones are excluded so a
@@ -110,19 +144,27 @@ class PairStats:
 
     @property
     def probe_loss_rate(self) -> float:
+        """EMA-based probe loss rate.  0.0 until MIN_PROBES is reached."""
         if self.probes_sent < self.MIN_PROBES:
             return 0.0
-        return (self.probes_sent - self.probes_recv) / self.probes_sent
+        return self.ema_probe_loss
 
     @property
     def real_loss_rate(self) -> float:
+        """EMA-based real-traffic loss rate.  0.0 until any packet is recorded."""
         if self.real_packets_sent == 0:
             return 0.0
-        return self.real_packets_lost / self.real_packets_sent
+        return self.ema_real_loss
 
     @property
     def combined_loss_rate(self) -> float:
-        """Blended loss rate: 70 % real + 30 % probe once real data exist."""
+        """Blended loss rate: 70 % real + 30 % probe once real data exist.
+
+        Both components are now exponential moving averages, so a pair
+        that was bad and has since recovered will see its combined loss
+        rate decay back down as fresh successful results arrive — no
+        permanent penalty from old failures.
+        """
         if self.real_packets_sent > 10:
             return 0.7 * self.real_loss_rate + 0.3 * self.probe_loss_rate
         return self.probe_loss_rate
@@ -183,35 +225,43 @@ class PairStats:
         dead_threshold: float = 0.80,
         latency_ms: float = 0.0,
     ) -> None:
-        """Update probe counters and flip ``alive`` if needed.
+        """Update probe EMA and flip ``alive`` if needed.
 
         Args:
             success:       Whether the TLS handshake succeeded.
-            dead_threshold: Loss rate above which the pair is marked dead.
+            dead_threshold: EMA loss above which the pair is marked dead.
             latency_ms:    TLS handshake duration in milliseconds.
                            Only recorded when success=True.
         """
         with self.lock:
             self.probes_sent += 1
             self.probed = True
+
+            loss_this = 0.0 if success else 1.0
+            a = self.EMA_ALPHA_PROBE
+            self.ema_probe_loss = a * loss_this + (1 - a) * self.ema_probe_loss
+
             if success:
                 self.probes_recv += 1
                 # Rolling average — only successful probes contribute.
                 self._latency_sum_ms += latency_ms
                 self._latency_count += 1
+
             if self.probes_sent >= self.MIN_PROBES:
-                loss = (self.probes_sent - self.probes_recv) / self.probes_sent
-                if loss >= dead_threshold:
+                if self.ema_probe_loss >= dead_threshold:
                     self.alive = False
                 elif self.probes_recv > 0:
                     self.alive = True
 
     def record_real_packet(self, lost: bool) -> None:
-        """Update real-traffic counters for a forwarded connection."""
+        """Update real-traffic loss EMA for a forwarded connection."""
         with self.lock:
             self.real_packets_sent += 1
             if lost:
                 self.real_packets_lost += 1
+            loss_this = 1.0 if lost else 0.0
+            a = self.EMA_ALPHA_REAL
+            self.ema_real_loss = a * loss_this + (1 - a) * self.ema_real_loss
 
     def start_draining(self) -> None:
         """Mark this pair as draining and record the start timestamp."""
@@ -282,13 +332,21 @@ class CombinationExplorer:
         self.dead_threshold = dead_threshold
 
         self.stats: Dict[Tuple[str, str], PairStats] = {
-            (ip, sni): PairStats(ip, sni)
+            (ip, sni): PairStats(ip, sni, origin="static")
             for ip, sni in combinations
         }
 
         self._unexplored: List[Tuple[str, str]] = list(combinations)
         random.shuffle(self._unexplored)
         self._lock = threading.Lock()
+
+        # Quarantine: IPs evicted for being weak are kept here (not fully
+        # discarded) so they can be randomly re-tested later and brought
+        # back into the pool if they have genuinely recovered.
+        # Maps ip -> dict with the SNI list it was evicted with, plus
+        # timestamps used for cooldown scheduling.
+        self._quarantine: Dict[str, dict] = {}
+        self._all_snis: List[str] = sorted({sni for _, sni in combinations})
 
         logger.info(
             "CombinationExplorer initialised: %d IP(s) × SNI(s) = %d pairs",
@@ -316,20 +374,37 @@ class CombinationExplorer:
     # Eviction — removes the weakest IP from the stats dict entirely
     # ------------------------------------------------------------------
 
-    def evict_weakest_ip(self, protected_ips: Set[str]) -> Optional[str]:
-        """Remove all pairs for the weakest IP from the stats dict.
+    def evict_weakest_ip(
+        self,
+        protected_ips: Set[str],
+        scope: str = "both",
+    ) -> Optional[str]:
+        """Move the weakest IP's pairs out of active stats into quarantine.
 
         The weakest IP is the one whose *average* combined_loss_rate across
         all its SNI pairs is highest.  IPs in ``protected_ips`` (those
         currently in the active pool or draining) are skipped so we never
         evict a pair that is serving live connections.
 
+        Args:
+            protected_ips: IPs that must never be evicted right now.
+            scope: Which IP origin is eligible for eviction:
+                   "static"  — only IPs from CONNECT_IPS in the config
+                   "dynamic" — only IPs found by the discovery scanner
+                   "both"    — either (default)
+
+        Evicted IPs are not discarded forever — they go into a quarantine
+        list (see ``recycle_attempt``) so they can be probed again later
+        and brought back if they have genuinely recovered.
+
         Returns the evicted IP string, or None if nothing was evicted.
         """
-        # Group known pairs by IP, skip protected ones.
+        # Group known pairs by IP, skip protected ones and out-of-scope origins.
         ip_loss: Dict[str, List[float]] = {}
         for (ip, _sni), ps in self.stats.items():
             if ip in protected_ips:
+                continue
+            if scope != "both" and ps.origin != scope:
                 continue
             if ps.probed:
                 ip_loss.setdefault(ip, []).append(ps.combined_loss_rate)
@@ -351,16 +426,137 @@ class CombinationExplorer:
 
         # Remove all pairs for this IP from stats and unexplored queue.
         keys_to_remove = [k for k in self.stats if k[0] == worst_ip]
+        snis_for_ip = [k[1] for k in keys_to_remove]
+        origin = self.stats[keys_to_remove[0]].origin if keys_to_remove else "static"
         for k in keys_to_remove:
             del self.stats[k]
         with self._lock:
             self._unexplored = [k for k in self._unexplored if k[0] != worst_ip]
 
+            # Move to quarantine instead of discarding entirely.
+            self._quarantine[worst_ip] = {
+                "snis": snis_for_ip,
+                "origin": origin,
+                "evicted_at": time.monotonic(),
+                "last_attempt": time.monotonic(),
+                "attempts": 0,
+            }
+
         logger.info(
-            "Evicted IP %s (avg loss %.1f%%, %d pair(s) removed)",
+            "Evicted IP %s to quarantine (avg loss %.1f%%, %d pair(s) removed)",
             worst_ip, worst_avg * 100, len(keys_to_remove),
         )
         return worst_ip
+
+    # ------------------------------------------------------------------
+    # Recycling — randomly re-test quarantined IPs and bring back winners
+    # ------------------------------------------------------------------
+
+    def recycle_attempt(
+        self,
+        batch: int,
+        min_cooldown: float,
+        max_quarantine: int,
+        scope: str = "both",
+    ) -> int:
+        """Randomly re-probe a few quarantined IPs; recover the healthy ones.
+
+        Args:
+            batch:          How many quarantined IPs to test this round.
+            min_cooldown:   Minimum seconds since last attempt before an IP
+                            is eligible to be re-tested again.
+            max_quarantine: Cap on quarantine size — oldest entries are
+                            dropped permanently when the cap is exceeded.
+            scope: Which quarantined IPs are eligible to be tested:
+                   "static"  — only IPs originally from CONNECT_IPS
+                   "dynamic" — only IPs originally found by discovery
+                   "both"    — either (default)
+
+        Returns:
+            Number of IPs successfully recovered back into ``self.stats``.
+        """
+        with self._lock:
+            # Enforce the quarantine size cap — drop the oldest entries
+            # for good so memory doesn't grow without bound.
+            if len(self._quarantine) > max_quarantine:
+                by_age = sorted(
+                    self._quarantine.items(), key=lambda kv: kv[1]["evicted_at"]
+                )
+                overflow = len(self._quarantine) - max_quarantine
+                for ip, _ in by_age[:overflow]:
+                    del self._quarantine[ip]
+                logger.debug(
+                    "Quarantine cap (%d) exceeded — dropped %d oldest IP(s) permanently.",
+                    max_quarantine, overflow,
+                )
+
+            now = time.monotonic()
+            eligible = [
+                ip for ip, info in self._quarantine.items()
+                if now - info["last_attempt"] >= min_cooldown
+                and (scope == "both" or info.get("origin", "static") == scope)
+            ]
+            if not eligible:
+                return 0
+
+            random.shuffle(eligible)
+            candidates = eligible[:batch]
+
+        recovered = 0
+        for ip in candidates:
+            if self._try_recycle_one(ip):
+                recovered += 1
+        return recovered
+
+    def _try_recycle_one(self, ip: str) -> bool:
+        """Probe one quarantined IP; if healthy, restore it to active stats.
+
+        Uses a fresh, temporary PairStats (no memory of the old failures)
+        so a recovered IP is judged purely on its current behaviour — this
+        is the "recycling" equivalent of starting the EMA from scratch.
+        """
+        with self._lock:
+            info = self._quarantine.get(ip)
+            if info is None:
+                return False
+            info["last_attempt"] = time.monotonic()
+            info["attempts"] += 1
+            snis = info["snis"] or self._all_snis
+            origin = info.get("origin", "static")
+
+        # Probe with a throwaway PairStats — one SNI is enough to decide
+        # whether the IP itself is reachable again; if it is, all of its
+        # original SNI pairs are restored fresh.
+        probe_sni = snis[0] if snis else (self._all_snis[0] if self._all_snis else None)
+        if probe_sni is None:
+            return False
+
+        trial = PairStats(ip, probe_sni, origin=origin)
+        self._probe_one(trial)
+
+        # Require a clearly healthy result before trusting the IP again.
+        if not trial.alive or trial.combined_loss_rate >= self.loss_threshold:
+            logger.debug(
+                "Recycle attempt failed for %s (loss=%.1f%%, alive=%s)",
+                ip, trial.combined_loss_rate * 100, trial.alive,
+            )
+            return False
+
+        # Healthy — restore all original (ip, sni) pairs as brand-new
+        # PairStats objects (same origin) so no stale EMA history carries over.
+        with self._lock:
+            del self._quarantine[ip]
+            for sni in snis:
+                key = (ip, sni)
+                if key not in self.stats:
+                    self.stats[key] = PairStats(ip, sni, origin=origin)
+                    self._unexplored.append(key)
+
+        logger.info(
+            "Recycled IP %s back into the pool (probe loss=%.1f%%, %d pair(s) restored)",
+            ip, trial.combined_loss_rate * 100, len(snis),
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Internal probing helpers
@@ -519,6 +715,12 @@ class ActivePool:
         max_draining: int = 5,
         evict_every: int = 3,
         evict_count: int = 2,
+        recycle_enabled: bool = True,
+        recycle_every: int = 6,
+        recycle_batch: int = 2,
+        recycle_min_cooldown: float = 180.0,
+        recycle_max_quarantine: int = 100,
+        quarantine_scope: str = "both",
     ) -> None:
         self.explorer = explorer
         self.slots = slots
@@ -527,6 +729,14 @@ class ActivePool:
         self.max_draining = max_draining
         self.evict_every = evict_every
         self.evict_count = evict_count
+        self.recycle_enabled = recycle_enabled
+        self.recycle_every = recycle_every
+        self.recycle_batch = recycle_batch
+        self.recycle_min_cooldown = recycle_min_cooldown
+        self.recycle_max_quarantine = recycle_max_quarantine
+        # Which IP origin is eligible for eviction + recycling:
+        # "static" (CONNECT_IPS only), "dynamic" (discovery only), or "both".
+        self.quarantine_scope = quarantine_scope
 
         self._pool: List[PairStats] = []
         self._draining: List[PairStats] = []
@@ -625,15 +835,35 @@ class ActivePool:
             protected = self._protected_ips()
             evicted_count = 0
             for _ in range(self.evict_count):
-                evicted = self.explorer.evict_weakest_ip(protected)
+                evicted = self.explorer.evict_weakest_ip(
+                    protected, scope=self.quarantine_scope
+                )
                 if not evicted:
                     break
                 evicted_count += 1
                 protected.discard(evicted)  # update so next iteration can evict a different IP
             if evicted_count:
                 logger.info(
-                    "Eviction cycle %d: removed %d IP(s)",
-                    self._refresh_count, evicted_count,
+                    "Eviction cycle %d: removed %d IP(s) (scope=%s)",
+                    self._refresh_count, evicted_count, self.quarantine_scope,
+                )
+
+        # ── 6. Periodic recycling of quarantined IPs ───────────────────
+        # Randomly re-test a few evicted IPs; recovered ones are restored
+        # to self.explorer.stats with fresh PairStats (no stale history).
+        # This runs independently of eviction so recovery isn't tied to
+        # the same cadence as removal.
+        if self.recycle_enabled and (self._refresh_count % self.recycle_every == 0):
+            recovered = self.explorer.recycle_attempt(
+                batch=self.recycle_batch,
+                min_cooldown=self.recycle_min_cooldown,
+                max_quarantine=self.recycle_max_quarantine,
+                scope=self.quarantine_scope,
+            )
+            if recovered:
+                logger.info(
+                    "Recycle cycle %d: restored %d IP(s) from quarantine (scope=%s)",
+                    self._refresh_count, recovered, self.quarantine_scope,
                 )
 
         self._log_pool("REFRESH")
@@ -750,6 +980,12 @@ class ConnectionManager:
         max_draining: int = 5,
         evict_every: int = 3,
         evict_count: int = 2,
+        recycle_enabled: bool = True,
+        recycle_every: int = 6,
+        recycle_batch: int = 2,
+        recycle_min_cooldown: float = 180.0,
+        recycle_max_quarantine: int = 100,
+        quarantine_scope: str = "both",
     ) -> None:
         self.interval = health_check_interval
 
@@ -769,6 +1005,12 @@ class ConnectionManager:
             max_draining=max_draining,
             evict_every=evict_every,
             evict_count=evict_count,
+            recycle_enabled=recycle_enabled,
+            recycle_every=recycle_every,
+            recycle_batch=recycle_batch,
+            recycle_min_cooldown=recycle_min_cooldown,
+            recycle_max_quarantine=recycle_max_quarantine,
+            quarantine_scope=quarantine_scope,
         )
 
     # ------------------------------------------------------------------
@@ -821,10 +1063,14 @@ def build_connection_manager(config: dict) -> Optional[ConnectionManager]:
     can fall back to the original direct-target code path.
 
     New config keys (all optional):
-      DRAIN_TIMEOUT   float  Seconds before a draining pair is force-closed
-                             (default: 30)
-      MAX_DRAINING    int    Max simultaneous draining pairs (default: 5)
-      EVICT_EVERY     int    Evict weakest IP every N health cycles (default: 3)
+      DRAIN_TIMEOUT     float  Seconds before a draining pair is force-closed
+                               (default: 30)
+      MAX_DRAINING      int    Max simultaneous draining pairs (default: 5)
+      EVICT_EVERY       int    Evict weakest IP every N health cycles (default: 3)
+      QUARANTINE_SCOPE  str    Which IPs are eligible for eviction +
+                               recycling: "static" (CONNECT_IPS only),
+                               "dynamic" (discovery only), or "both"
+                               (default: "both")
     """
     ips: List[str] = config.get("CONNECT_IPS", [])
     snis: List[str] = config.get("FAKE_SNIS", [])
@@ -850,6 +1096,14 @@ def build_connection_manager(config: dict) -> Optional[ConnectionManager]:
         len(ips), len(snis), len(combinations),
     )
 
+    quarantine_scope = config.get("QUARANTINE_SCOPE", "both")
+    if quarantine_scope not in ("static", "dynamic", "both"):
+        logger.warning(
+            "Invalid QUARANTINE_SCOPE %r — falling back to 'both'.",
+            quarantine_scope,
+        )
+        quarantine_scope = "both"
+
     return ConnectionManager(
         combinations=combinations,
         port=config.get("CONNECT_PORT", 443),
@@ -863,4 +1117,10 @@ def build_connection_manager(config: dict) -> Optional[ConnectionManager]:
         max_draining=config.get("MAX_DRAINING", 5),
         evict_every=config.get("EVICT_EVERY", 3),
         evict_count=config.get("EVICT_COUNT", 2),
+        recycle_enabled=config.get("RECYCLE_ENABLED", True),
+        recycle_every=config.get("RECYCLE_EVERY", 6),
+        recycle_batch=config.get("RECYCLE_BATCH", 2),
+        recycle_min_cooldown=config.get("RECYCLE_MIN_COOLDOWN", 180.0),
+        recycle_max_quarantine=config.get("RECYCLE_MAX_QUARANTINE", 100),
+        quarantine_scope=quarantine_scope,
     )
