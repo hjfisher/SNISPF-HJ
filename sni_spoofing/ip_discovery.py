@@ -374,7 +374,7 @@ class IPDiscovery:
         for sni in self.snis:
             key = (ip, sni)
             if key not in self.manager.explorer.stats:
-                ps = PairStats(ip, sni)
+                ps = PairStats(ip, sni, origin="dynamic")
                 self.manager.explorer.stats[key] = ps
                 # Also add to the unexplored queue so it gets probed soon.
                 with self.manager.explorer._lock:
