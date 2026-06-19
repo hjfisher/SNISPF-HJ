@@ -15,10 +15,11 @@
 **[FA README | توضیحات فارسی](README_FA.md)**
 
 **SNISPF-HJ** is a fork of [SNISPF](https://github.com/Rainman69/SNISPF) by
-[@Rainman69](https://github.com/Rainman69), extended with an **adaptive
-multi-IP / multi-SNI connection pool** and **dynamic Cloudflare IP discovery**,
-ported from ideas by [@patterniha](https://github.com/patterniha) and
-[@hjfisher](https://github.com/hjfisher).
+[@Rainman69](https://github.com/Rainman69), extended with a **self-healing
+multi-IP / multi-SNI connection pool** and **dynamic Cloudflare IP
+discovery**, built on ideas from [@patterniha](https://github.com/patterniha),
+[@hjfisher](https://github.com/hjfisher), and
+[@bia-pain-bache](https://github.com/bia-pain-bache).
 
 Runs on **Windows, macOS, Linux, and Android (Termux)** — no root required for
 the default bypass method.
@@ -37,8 +38,11 @@ Any idea? → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discuss
 - [Installation](#installation)
 - [Building a Standalone Executable](#building-a-standalone-executable)
 - [Quick Start](#quick-start)
+- [Building Your Config Visually](#building-your-config-visually)
 - [Configuration](#configuration)
 - [Pool Settings](#pool-settings)
+- [Scoring: How a Pair's Health Is Measured](#scoring-how-a-pairs-health-is-measured)
+- [IP Eviction, Quarantine & Recycling](#ip-eviction-quarantine--recycling)
 - [Dynamic IP Discovery](#dynamic-ip-discovery)
 - [CLI Flags](#cli-flags)
 - [Bypass Methods](#bypass-methods)
@@ -57,15 +61,19 @@ Any idea? → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discuss
 | Feature | Original SNISPF | SNISPF-HJ |
 |---|---|---|
 | Upstream targets | Single IP + single SNI | Multiple IPs × multiple SNIs |
-| Health checking | None | Continuous TCP probe loop |
-| Pair selection | Static | Weighted-random (lower loss = higher chance) |
+| Health checking | None | Real TLS handshake probes (not just TCP) |
+| Pair selection | Static | Weighted-random, score = loss + latency |
+| Loss tracking | — | Exponential moving average (self-recovering) |
 | Graceful rotation | No | Draining with configurable timeout |
 | Forced drain close | No | Connections closed after `DRAIN_TIMEOUT` seconds |
-| IP eviction | No | Weakest IPs periodically removed from pool |
+| IP eviction | No | Weakest IPs periodically quarantined |
+| IP recycling | No | Quarantined IPs re-tested and restored if healthy |
+| Eviction/recycle scope | — | Choose static-only, dynamic-only, or both |
 | Dynamic IP discovery | No | Scans Cloudflare CIDR ranges at runtime |
+| Visual config builder | No | Built-in browser UI (`--config-ui`) |
 | Entry point | `snispf` | `snispf` **and** `snispf-hj` |
 | Config keys | `CONNECT_IP`, `FAKE_SNI` | `CONNECT_IPS` (list), `FAKE_SNIS` (list) |
-| New modules | — | `pool.py`, `ip_discovery.py` |
+| New modules | — | `pool.py`, `ip_discovery.py`, `config_server.py` |
 
 All original features (fragmentation, fake-SNI, combined, domain checker, raw
 injection, TTL trick) are fully preserved.
@@ -96,11 +104,21 @@ real hostname.
 
 ### The Connection Pool
 
-On startup the tool probes a random sample of `(IP, SNI)` pairs. Pairs that
-respond well enter the **active pool**. A background thread re-checks the pool
-every ~30 seconds and rotates out degraded pairs. Each new connection is
-assigned a pair using **weighted-random selection** (lower loss = higher
-probability).
+On startup the tool probes a random sample of `(IP, SNI)` pairs with a real
+**TLS handshake** (not just a TCP connect — a server can accept TCP but still
+reject or drop TLS traffic, so a true handshake is the only reliable test).
+Pairs that respond well enter the **active pool**. A background thread
+re-checks the pool every ~30 seconds and rotates out degraded pairs. Each new
+connection is assigned a pair using **weighted-random selection** — lower
+score means higher probability of being picked.
+
+### Self-Healing Loss Tracking
+
+Loss is tracked as an **exponential moving average (EMA)**, not a lifetime
+counter. This means a pair that performed badly for a while and has since
+recovered will see its score improve as fresh good results arrive — old
+failures fade out instead of permanently dragging the pair down. See
+[Scoring](#scoring-how-a-pairs-health-is-measured) for the exact formula.
 
 ### Draining with Timeout
 
@@ -110,22 +128,21 @@ assigned to it, but existing ones keep running. After `DRAIN_TIMEOUT` seconds
 the pair can be fully retired. A cap of `MAX_DRAINING` pairs prevents the
 draining list from growing out of control.
 
-### IP Eviction
+### IP Eviction → Quarantine → Recycling
 
-Every `EVICT_EVERY` health cycles (default: every 3 × 30 s = 90 s), the
-`EVICT_COUNT` weakest IPs (by average loss rate) are permanently removed from
-the pool, making room for fresh IPs found by the discovery thread. IPs that
-are currently serving active connections are protected from eviction.
+Weak IPs aren't deleted forever — they're **quarantined** and periodically
+re-tested. If an IP genuinely recovers, it's welcomed back with a clean slate.
+See [IP Eviction, Quarantine & Recycling](#ip-eviction-quarantine--recycling).
 
 ### Dynamic IP Discovery
 
 A second background thread continuously samples random IPs from Cloudflare's
 official CIDR ranges (e.g. `104.16.0.0/13`, `172.64.0.0/13`, …), probes them
-with TCP connects, and injects the healthy ones into the pool — all while the
-proxy is serving connections.
+with a real TLS handshake, and injects the healthy ones into the pool — all
+while the proxy is serving connections.
 
 ```
-15 Cloudflare CIDRs  →  sample 100 random IPs  →  TCP probe (parallel)
+15 Cloudflare CIDRs  →  sample 100 random IPs  →  TLS handshake probe (parallel)
         ↓ accepted (≥50% success)
   inject as new (IP × SNI) pairs into explorer
         ↓ pool.refresh()
@@ -262,6 +279,36 @@ Point your client (`v2ray`, `xray`, browser proxy plugin, …) at
 
 ---
 
+## Building Your Config Visually
+
+Editing JSON by hand isn't for everyone. SNISPF-HJ ships with a built-in
+**Config Builder UI** that opens directly in your browser — no separate
+download, no copy-pasting a link.
+
+```bash
+snispf-hj --config-ui
+
+# Custom port
+snispf-hj --config-ui --ui-port 8080
+
+# Save directly over your existing config file
+snispf-hj --config-ui --config my_config.json
+```
+
+This starts a small local server (bound to `127.0.0.1` only — never exposed
+to your network) and automatically opens the UI in your default browser. From
+there you can:
+
+- Add/remove IPs and SNIs with quick-add buttons (built-in Cloudflare IP list)
+- Tune pool, drain, eviction, and discovery parameters with sliders
+- Preview the generated `config.json` with syntax highlighting
+- Click **"Save to server"** to write the file directly, or **"Download"**
+  to save it manually
+
+Press `Ctrl+C` in the terminal to stop the config server when you're done.
+
+---
+
 ## Configuration
 
 CLI flags override config file values.
@@ -277,7 +324,7 @@ CLI flags override config file values.
   "USE_TTL_TRICK": false,
   "FAKE_SNI_METHOD": "prefix_fake",
 
-  // ── Static pool ────────────────────────────────────────────────────
+  // ── Pool ───────────────────────────────────────────────────────────
   "ACTIVE_SLOTS": 3,
   "HEALTH_CHECK_INTERVAL": 30,
   "HEALTH_CHECK_TIMEOUT": 3,
@@ -286,8 +333,16 @@ CLI flags override config file values.
   "DEAD_THRESHOLD": 0.80,
   "DRAIN_TIMEOUT": 30,
   "MAX_DRAINING": 5,
+
+  // ── Eviction & recycling ───────────────────────────────────────────
   "EVICT_EVERY": 3,
   "EVICT_COUNT": 2,
+  "RECYCLE_ENABLED": true,
+  "RECYCLE_EVERY": 6,
+  "RECYCLE_BATCH": 2,
+  "RECYCLE_MIN_COOLDOWN": 180,
+  "RECYCLE_MAX_QUARANTINE": 100,
+  "QUARANTINE_SCOPE": "both",        // static | dynamic | both
 
   "CONNECT_IPS": [
     "172.66.41.252",
@@ -321,22 +376,134 @@ CLI flags override config file values.
 | `FAKE_SNIS` | `[]` | Fake SNI hostname list |
 | `ACTIVE_SLOTS` | `3` | Pairs kept active simultaneously |
 | `HEALTH_CHECK_INTERVAL` | `30` | Seconds between re-probe cycles |
-| `HEALTH_CHECK_TIMEOUT` | `3` | TCP connect timeout per probe (s) |
-| `PROBE_COUNT` | `5` | TCP probes per pair per cycle |
-| `LOSS_THRESHOLD` | `0.20` | Loss rate above which a pair is drained |
-| `DEAD_THRESHOLD` | `0.80` | Loss rate above which a pair is marked dead |
+| `HEALTH_CHECK_TIMEOUT` | `3` | TLS handshake timeout per probe (s) |
+| `PROBE_COUNT` | `5` | TLS probes per pair per cycle |
+| `LOSS_THRESHOLD` | `0.20` | Loss score above which a pair is drained |
+| `DEAD_THRESHOLD` | `0.80` | Loss score above which a pair is marked dead |
 | `DRAIN_TIMEOUT` | `30` | Seconds before a draining pair's connections are force-closed |
 | `MAX_DRAINING` | `5` | Max simultaneous draining pairs; oldest is force-closed if exceeded |
+
+**Single-pair mode:** if both `CONNECT_IPS`/`FAKE_SNIS` lists have exactly one
+entry (or legacy `CONNECT_IP` / `FAKE_SNI` keys are used), the pool is
+disabled and the tool runs in direct mode with no overhead.
+
+---
+
+## Scoring: How a Pair's Health Is Measured
+
+Every `(IP, SNI)` pair is probed with a **real TLS handshake** — a plain TCP
+connect isn't enough, since a server can accept the TCP connection and still
+refuse or drop the TLS layer. The probe uses the pair's own SNI, so the test
+reflects exactly what the forwarder will send in production traffic.
+
+### Loss tracking — exponential moving average
+
+Instead of a lifetime "successes vs failures" counter, each pair keeps an
+**EMA (exponential moving average)** of its loss, separately for probe
+results and real forwarded traffic:
+
+```
+ema_loss_new = α × loss_this_event + (1 − α) × ema_loss_previous
+```
+
+- `α` (probe) = `0.25` — probes happen on a fixed schedule, so a moderate
+  alpha keeps the score responsive to recent conditions.
+- `α` (real traffic) = `0.15` — real connections can arrive in bursts, so a
+  smaller alpha prevents one bad burst from dominating the score.
+
+**Why this matters:** a pair that was unhealthy for a while and has since
+recovered will see its EMA decay back toward zero as fresh successful results
+come in — old failures fade out rather than permanently weighing the pair
+down. There's no fixed "memory window" to tune; the recovery curve is smooth
+and automatic.
+
+### Composite score
+
+```
+score = 0.60 × combined_loss_rate
+      + 0.20 × latency_score
+      + 0.20 × probe_loss_rate
+```
+
+- `combined_loss_rate` blends 70% real-traffic EMA loss + 30% probe EMA loss
+  (once at least 10 real packets have been observed; before that, pure probe
+  loss is used).
+- `latency_score` is the average TLS handshake time, normalised against a
+  1500 ms cap — a pair that's loss-free but consistently slow still scores
+  worse than a fast one.
+- `probe_loss_rate` is included on its own (in addition to being part of
+  `combined_loss_rate`) so probe health always has some direct weight even
+  once real traffic exists.
+
+Lower score = better. A dead pair scores `+inf` (never selected). A
+not-yet-probed pair scores `0.5` so unknowns get a fair first chance instead
+of being assumed bad.
+
+---
+
+## IP Eviction, Quarantine & Recycling
+
+Pools don't grow forever, and dead weight shouldn't sit there hurting your
+average. Every `EVICT_EVERY` health cycles, the `EVICT_COUNT` IPs with the
+worst average score are evicted — but **not deleted**. They move to a
+**quarantine** list.
+
+```
+Active pool → degraded → EVICT_EVERY cycles → quarantine
+                                                    │
+                                    RECYCLE_EVERY   │  random sample,
+                                    cycles           ▼  re-probed with TLS
+                                              ┌─────────────┐
+                                              │  healthy?   │
+                                              └──────┬──────┘
+                                      yes ───────────┤─────────── no
+                                       │                          │
+                                       ▼                          ▼
+                          restored with a fresh,         stays in quarantine
+                          zero-history PairStats           until next attempt
+                          (back in the active rotation)    (respecting cooldown)
+```
+
+Every `RECYCLE_EVERY` cycles, a random batch of quarantined IPs is re-tested
+with a real TLS handshake. An IP that passes is restored with a **brand new**
+`PairStats` object — no memory of its previous failures — so it's judged
+purely on how it performs now. IPs that fail stay quarantined until their next
+eligible attempt (governed by `RECYCLE_MIN_COOLDOWN`).
+
+The quarantine list itself is capped at `RECYCLE_MAX_QUARANTINE` entries — the
+oldest are permanently dropped if it grows past that, so memory use stays
+bounded even over very long runs.
+
+### Choosing which IPs are eligible: `QUARANTINE_SCOPE`
+
+By default, both your hand-picked IPs (`CONNECT_IPS` in the config) and IPs
+found by the discovery scanner are eligible for eviction and recycling. You
+can narrow this with `QUARANTINE_SCOPE`:
+
+| Value | Behaviour |
+|---|---|
+| `"both"` (default) | Both static and dynamically-discovered IPs can be evicted/recycled |
+| `"static"` | Only IPs you listed in `CONNECT_IPS` are evicted/recycled — discovered IPs are left alone |
+| `"dynamic"` | Only IPs found by the discovery scanner are evicted/recycled — your hand-picked list is never touched |
+
+This is useful if, say, you trust your own curated IP list and only want the
+churn/recycling behaviour applied to whatever the discovery scanner finds.
+
+| Key | Default | Description |
+|---|---|---|
 | `EVICT_EVERY` | `3` | Evict weakest IPs every N health cycles |
 | `EVICT_COUNT` | `2` | Number of IPs to evict per eviction cycle |
+| `RECYCLE_ENABLED` | `true` | Enable/disable the recycling mechanism |
+| `RECYCLE_EVERY` | `6` | Attempt recycling every N health cycles |
+| `RECYCLE_BATCH` | `2` | How many quarantined IPs to re-test per attempt |
+| `RECYCLE_MIN_COOLDOWN` | `180` | Minimum seconds between re-test attempts on the same IP |
+| `RECYCLE_MAX_QUARANTINE` | `100` | Cap on quarantine size; oldest entries are dropped permanently beyond this |
+| `QUARANTINE_SCOPE` | `"both"` | Which IP origin is eligible: `"static"`, `"dynamic"`, or `"both"` |
 
-**Single-pair mode:** if both lists have exactly one entry (or legacy
-`CONNECT_IP` / `FAKE_SNI` keys are used), the pool is disabled and the tool
-runs in direct mode with no overhead.
-
-**Eviction timing example:** with `HEALTH_CHECK_INTERVAL=30`, `EVICT_EVERY=3`,
-`EVICT_COUNT=2` → every 90 seconds the 2 weakest IPs are removed and replaced
-by fresh ones from the discovery thread.
+**Timing example:** with the defaults (`HEALTH_CHECK_INTERVAL=30`,
+`EVICT_EVERY=3`, `EVICT_COUNT=2`) → every 90 seconds the 2 weakest IPs are
+quarantined. With `RECYCLE_EVERY=6` → every 180 seconds, 2 random quarantined
+IPs get a second chance.
 
 ---
 
@@ -347,15 +514,20 @@ by fresh ones from the discovery thread.
 | `DYNAMIC_IP_DISCOVERY` | `false` | Enable discovery (set `true` to activate) |
 | `DISCOVERY_BATCH` | `100` | Random IPs sampled per round |
 | `DISCOVERY_INTERVAL` | `120` | Seconds between scan rounds |
-| `DISCOVERY_PROBE_TRIES` | `3` | TCP connect attempts per candidate |
-| `DISCOVERY_TIMEOUT` | `2.0` | TCP connect timeout per attempt (s) |
+| `DISCOVERY_PROBE_TRIES` | `3` | TLS handshake attempts per candidate |
+| `DISCOVERY_TIMEOUT` | `2.0` | TLS handshake timeout per attempt (s) |
 | `DISCOVERY_MIN_SUCCESS` | `0.50` | Minimum success rate to accept an IP (0–1) |
 | `DISCOVERY_MAX_IPS` | `200` | Cap on dynamically discovered IPs |
 
 Discovery samples from Cloudflare's official IP ranges and only accepts IPs
-that pass the TCP probe threshold. All logic runs in a daemon thread and never
-interrupts live connections. The first scan starts 15 seconds after launch to
-let the pool bootstrap first.
+that complete a real TLS handshake at or above the success threshold — a bare
+TCP connect isn't enough, since some IPs accept the connection but never
+complete TLS. All logic runs in a daemon thread and never interrupts live
+connections. The first scan starts 15 seconds after launch to let the pool
+bootstrap first.
+
+IPs found this way are tagged with `origin = "dynamic"` internally, which is
+what `QUARANTINE_SCOPE` uses to distinguish them from your `CONNECT_IPS`.
 
 ---
 
@@ -364,23 +536,25 @@ let the pool bootstrap first.
 ```
 --config, -C FILE         Path to JSON config file
 --generate-config PATH    Write a default config and exit
---listen, -l HOST:PORT    Listen address (default: 0.0.0.0:40443)
---connect, -c IP:PORT     Target server (single-pair mode)
---sni,    -s HOSTNAME     Fake SNI hostname (single-pair mode)
---method, -m METHOD       fragment | fake_sni | combined
---fragment-strategy STR   sni_split | half | multi | tls_record_frag
---fragment-delay  SEC     Delay between fragments (seconds)
---ttl-trick               Enable IP TTL trick for decoy packets
---no-raw                  Disable raw socket injection
---check-domains FILE      Bulk-check domains for Cloudflare backing
---check-workers N         Parallel workers (default: 50)
---check-timeout SEC       Per-domain timeout (default: 3.0)
---output FILE             Save verified domains to file
---check-http              Also verify HTTP during domain check
---verbose, -v             Debug logging
---quiet,   -q             Warnings only
---version, -V             Print version and exit
---info                    Show platform capabilities and exit
+--config-ui                Open the built-in Config Builder UI in your browser
+--ui-port PORT             Port for the Config Builder UI (default: 40080)
+--listen, -l HOST:PORT     Listen address (default: 0.0.0.0:40443)
+--connect, -c IP:PORT      Target server (single-pair mode)
+--sni,    -s HOSTNAME      Fake SNI hostname (single-pair mode)
+--method, -m METHOD        fragment | fake_sni | combined
+--fragment-strategy STR    sni_split | half | multi | tls_record_frag
+--fragment-delay  SEC      Delay between fragments (seconds)
+--ttl-trick                Enable IP TTL trick for decoy packets
+--no-raw                   Disable raw socket injection
+--check-domains FILE       Bulk-check domains for Cloudflare backing
+--check-workers N          Parallel workers (default: 50)
+--check-timeout SEC        Per-domain timeout (default: 3.0)
+--output FILE              Save verified domains to file
+--check-http               Also verify HTTP during domain check
+--verbose, -v              Debug logging
+--quiet,   -q              Warnings only
+--version, -V              Print version and exit
+--info                     Show platform capabilities and exit
 ```
 
 ---
@@ -445,7 +619,8 @@ python -m PyInstaller --onefile --name snispf-hj run.py
 ```
 
 **Pool shows all pairs as dead**
-- Check that `CONNECT_IPS` are reachable on port 443.
+- Check that `CONNECT_IPS` are reachable on port 443 with a real TLS handshake
+  (not just TCP — some hosts accept the connection but drop the TLS layer).
 - Raise `HEALTH_CHECK_TIMEOUT` to `6`.
 - Raise `DEAD_THRESHOLD` to `0.90`.
 
@@ -453,9 +628,20 @@ python -m PyInstaller --onefile --name snispf-hj run.py
 - This may be `DRAIN_TIMEOUT` firing. Raise it: `"DRAIN_TIMEOUT": 60`.
 - Or reduce `EVICT_COUNT` to `1` to slow down IP rotation.
 
+**A pair that used to work seems permanently stuck as "bad"**
+- This shouldn't happen any more — loss is tracked as an EMA, so a pair that
+  recovers will see its score improve automatically as fresh successful
+  probes/connections come in. If it still looks stuck, check whether it was
+  fully evicted; quarantined IPs only get re-tested every `RECYCLE_EVERY`
+  cycles (respecting `RECYCLE_MIN_COOLDOWN`), so recovery isn't instant.
+
 **Discovery finds nothing**
 - Your network may block outbound probes — try `"DISCOVERY_TIMEOUT": 4.0`.
 - Loosen the threshold: `"DISCOVERY_MIN_SUCCESS": 0.34`.
+
+**Want to protect your hand-picked IPs from eviction**
+- Set `"QUARANTINE_SCOPE": "dynamic"` — only discovery-found IPs will ever
+  be evicted/recycled; your `CONNECT_IPS` list is left untouched.
 
 **Bypass doesn't work for some sites**
 - Try `--method combined --fragment-strategy multi`.
@@ -482,9 +668,12 @@ SNISPF-HJ/
 └── sni_spoofing/
     ├── cli.py                    # argparse + main entry point
     ├── forwarder.py              # Async TCP forwarder + pool integration
-    ├── pool.py                   # PairStats, CombinationExplorer,
-    │                             # ActivePool, ConnectionManager
-    ├── ip_discovery.py           # ★ Dynamic Cloudflare IP scanner
+    ├── pool.py                   # PairStats (EMA, latency, scoring),
+    │                             # CombinationExplorer (probing, eviction,
+    │                             # quarantine, recycling), ActivePool,
+    │                             # ConnectionManager
+    ├── ip_discovery.py           # Dynamic Cloudflare IP scanner (TLS probe)
+    ├── config_server.py          # ★ Built-in visual Config Builder UI
     ├── bypass/                   # Fragment / fake-SNI / raw-injection
     ├── tls/                      # ClientHello builder + parser
     ├── scanner/                  # Bulk Cloudflare domain checker
@@ -500,8 +689,9 @@ SNISPF-HJ/
 - **[@patterniha](https://github.com/patterniha)** — original SNI-spoofing concept
   and the multi-IP/SNI combination explorer idea.
 - **[@hjfisher](https://github.com/hjfisher)** — `CombinationExplorer`,
-  `ActivePool`, `ConnectionManager`, `IPDiscovery`, drain timeout, IP eviction,
-  and pool integration.
+  `ActivePool`, `ConnectionManager`, `IPDiscovery`, EMA-based scoring, drain
+  timeout, IP eviction/quarantine/recycling, the visual Config Builder, and
+  overall pool integration.
 - **[@bia-pain-bache](https://github.com/bia-pain-bache)** and
   **[@Ptechgithub](https://github.com/Ptechgithub)** — Cloudflare IP scanning
   methodology that inspired `ip_discovery.py`.
