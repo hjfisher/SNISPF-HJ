@@ -38,7 +38,6 @@ Any idea? → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discuss
 - [Installation](#installation)
 - [Building a Standalone Executable](#building-a-standalone-executable)
 - [Quick Start](#quick-start)
-- [Building Your Config Visually](#building-your-config-visually)
 - [Configuration](#configuration)
 - [Pool Settings](#pool-settings)
 - [Scoring: How a Pair's Health Is Measured](#scoring-how-a-pairs-health-is-measured)
@@ -70,10 +69,9 @@ Any idea? → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discuss
 | IP recycling | No | Quarantined IPs re-tested and restored if healthy |
 | Eviction/recycle scope | — | Choose static-only, dynamic-only, or both |
 | Dynamic IP discovery | No | Scans Cloudflare CIDR ranges at runtime |
-| Visual config builder | No | Built-in browser UI (`--config-ui`) |
 | Entry point | `snispf` | `snispf` **and** `snispf-hj` |
 | Config keys | `CONNECT_IP`, `FAKE_SNI` | `CONNECT_IPS` (list), `FAKE_SNIS` (list) |
-| New modules | — | `pool.py`, `ip_discovery.py`, `config_server.py` |
+| New modules | — | `pool.py`, `ip_discovery.py` |
 
 All original features (fragmentation, fake-SNI, combined, domain checker, raw
 injection, TTL trick) are fully preserved.
@@ -276,36 +274,6 @@ Ready! Configure your application to use:
 
 Point your client (`v2ray`, `xray`, browser proxy plugin, …) at
 **`127.0.0.1:40443`**.
-
----
-
-## Building Your Config Visually
-
-Editing JSON by hand isn't for everyone. SNISPF-HJ ships with a built-in
-**Config Builder UI** that opens directly in your browser — no separate
-download, no copy-pasting a link.
-
-```bash
-snispf-hj --config-ui
-
-# Custom port
-snispf-hj --config-ui --ui-port 8080
-
-# Save directly over your existing config file
-snispf-hj --config-ui --config my_config.json
-```
-
-This starts a small local server (bound to `127.0.0.1` only — never exposed
-to your network) and automatically opens the UI in your default browser. From
-there you can:
-
-- Add/remove IPs and SNIs with quick-add buttons (built-in Cloudflare IP list)
-- Tune pool, drain, eviction, and discovery parameters with sliders
-- Preview the generated `config.json` with syntax highlighting
-- Click **"Save to server"** to write the file directly, or **"Download"**
-  to save it manually
-
-Press `Ctrl+C` in the terminal to stop the config server when you're done.
 
 ---
 
@@ -536,8 +504,6 @@ what `QUARANTINE_SCOPE` uses to distinguish them from your `CONNECT_IPS`.
 ```
 --config, -C FILE         Path to JSON config file
 --generate-config PATH    Write a default config and exit
---config-ui                Open the built-in Config Builder UI in your browser
---ui-port PORT             Port for the Config Builder UI (default: 40080)
 --listen, -l HOST:PORT     Listen address (default: 0.0.0.0:40443)
 --connect, -c IP:PORT      Target server (single-pair mode)
 --sni,    -s HOSTNAME      Fake SNI hostname (single-pair mode)
@@ -673,7 +639,6 @@ SNISPF-HJ/
     │                             # quarantine, recycling), ActivePool,
     │                             # ConnectionManager
     ├── ip_discovery.py           # Dynamic Cloudflare IP scanner (TLS probe)
-    ├── config_server.py          # ★ Built-in visual Config Builder UI
     ├── bypass/                   # Fragment / fake-SNI / raw-injection
     ├── tls/                      # ClientHello builder + parser
     ├── scanner/                  # Bulk Cloudflare domain checker
@@ -690,8 +655,7 @@ SNISPF-HJ/
   and the multi-IP/SNI combination explorer idea.
 - **[@hjfisher](https://github.com/hjfisher)** — `CombinationExplorer`,
   `ActivePool`, `ConnectionManager`, `IPDiscovery`, EMA-based scoring, drain
-  timeout, IP eviction/quarantine/recycling, the visual Config Builder, and
-  overall pool integration.
+  timeout, IP eviction/quarantine/recycling, and overall pool integration.
 - **[@bia-pain-bache](https://github.com/bia-pain-bache)** and
   **[@Ptechgithub](https://github.com/Ptechgithub)** — Cloudflare IP scanning
   methodology that inspired `ip_discovery.py`.
