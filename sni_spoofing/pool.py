@@ -98,14 +98,25 @@ class PairStats:
     EMA_ALPHA_PROBE: float = 0.25
     EMA_ALPHA_REAL: float = 0.15
 
-    def __init__(self, ip: str, sni: str, origin: str = "static") -> None:
+    def __init__(
+        self,
+        ip: str,
+        sni: str,
+        ip_origin: str = "static",
+        sni_origin: str = "static",
+    ) -> None:
         self.ip: str = ip
         self.sni: str = sni
         # Where this pair's IP came from:
         #   "static"  — listed in CONNECT_IPS in the config file
         #   "dynamic" — found at runtime by the IP discovery scanner
-        # Used to scope eviction/quarantine/recycling to one source or both.
-        self.origin: str = origin
+        # Used to scope IP eviction/quarantine/recycling to one source or both.
+        self.ip_origin: str = ip_origin
+        # Where this pair's SNI came from:
+        #   "static"  — listed in FAKE_SNIS in the config file
+        #   "dynamic" — found at runtime by the SNI discovery scanner
+        # Used to scope SNI eviction/quarantine/recycling to one source or both.
+        self.sni_origin: str = sni_origin
 
         self.probes_sent: int = 0
         self.probes_recv: int = 0
@@ -332,7 +343,7 @@ class CombinationExplorer:
         self.dead_threshold = dead_threshold
 
         self.stats: Dict[Tuple[str, str], PairStats] = {
-            (ip, sni): PairStats(ip, sni, origin="static")
+            (ip, sni): PairStats(ip, sni, ip_origin="static", sni_origin="static")
             for ip, sni in combinations
         }
 
@@ -345,8 +356,13 @@ class CombinationExplorer:
         # back into the pool if they have genuinely recovered.
         # Maps ip -> dict with the SNI list it was evicted with, plus
         # timestamps used for cooldown scheduling.
-        self._quarantine: Dict[str, dict] = {}
+        self._ip_quarantine: Dict[str, dict] = {}
+        # Mirror structure for SNIs: maps sni -> dict with the IP list it
+        # was evicted with, plus cooldown timestamps.
+        self._sni_quarantine: Dict[str, dict] = {}
+
         self._all_snis: List[str] = sorted({sni for _, sni in combinations})
+        self._all_ips: List[str] = sorted({ip for ip, _ in combinations})
 
         logger.info(
             "CombinationExplorer initialised: %d IP(s) × SNI(s) = %d pairs",
@@ -393,9 +409,9 @@ class CombinationExplorer:
                    "dynamic" — only IPs found by the discovery scanner
                    "both"    — either (default)
 
-        Evicted IPs are not discarded forever — they go into a quarantine
-        list (see ``recycle_attempt``) so they can be probed again later
-        and brought back if they have genuinely recovered.
+        Evicted IPs are not discarded forever — they go into the IP
+        quarantine list (see ``recycle_ip_attempt``) so they can be probed
+        again later and brought back if they have genuinely recovered.
 
         Returns the evicted IP string, or None if nothing was evicted.
         """
@@ -404,7 +420,7 @@ class CombinationExplorer:
         for (ip, _sni), ps in self.stats.items():
             if ip in protected_ips:
                 continue
-            if scope != "both" and ps.origin != scope:
+            if scope != "both" and ps.ip_origin != scope:
                 continue
             if ps.probed:
                 ip_loss.setdefault(ip, []).append(ps.combined_loss_rate)
@@ -419,7 +435,7 @@ class CombinationExplorer:
         # Only evict if the IP is genuinely bad (above loss_threshold).
         if worst_avg < self.loss_threshold:
             logger.debug(
-                "Eviction skipped — best candidate %s has avg loss %.1f%% < threshold",
+                "IP eviction skipped — best candidate %s has avg loss %.1f%% < threshold",
                 worst_ip, worst_avg * 100,
             )
             return None
@@ -427,16 +443,17 @@ class CombinationExplorer:
         # Remove all pairs for this IP from stats and unexplored queue.
         keys_to_remove = [k for k in self.stats if k[0] == worst_ip]
         snis_for_ip = [k[1] for k in keys_to_remove]
-        origin = self.stats[keys_to_remove[0]].origin if keys_to_remove else "static"
+        ip_origin = self.stats[keys_to_remove[0]].ip_origin if keys_to_remove else "static"
         for k in keys_to_remove:
             del self.stats[k]
         with self._lock:
             self._unexplored = [k for k in self._unexplored if k[0] != worst_ip]
+            self._all_ips = [ip for ip in self._all_ips if ip != worst_ip]
 
             # Move to quarantine instead of discarding entirely.
-            self._quarantine[worst_ip] = {
+            self._ip_quarantine[worst_ip] = {
                 "snis": snis_for_ip,
-                "origin": origin,
+                "origin": ip_origin,
                 "evicted_at": time.monotonic(),
                 "last_attempt": time.monotonic(),
                 "attempts": 0,
@@ -448,11 +465,105 @@ class CombinationExplorer:
         )
         return worst_ip
 
+    def evict_weakest_sni(
+        self,
+        protected_snis: Set[str],
+        scope: str = "both",
+    ) -> Optional[str]:
+        """Move the weakest SNI's pairs out of active stats into quarantine.
+
+        Mirrors ``evict_weakest_ip`` exactly, but groups by SNI instead of
+        IP. The weakest SNI is the one whose *average* combined_loss_rate
+        across all its IP pairs is highest. SNIs in ``protected_snis``
+        (those currently in the active pool or draining) are skipped.
+
+        Args:
+            protected_snis: SNIs that must never be evicted right now.
+            scope: Which SNI origin is eligible for eviction:
+                   "static"  — only SNIs from FAKE_SNIS in the config
+                   "dynamic" — only SNIs found by the SNI discovery scanner
+                   "both"    — either (default)
+
+        Evicted SNIs are not discarded forever — they go into the SNI
+        quarantine list (see ``recycle_sni_attempt``) so they can be probed
+        again later and brought back if they have genuinely recovered.
+
+        Returns the evicted SNI string, or None if nothing was evicted.
+        """
+        sni_loss: Dict[str, List[float]] = {}
+        for (_ip, sni), ps in self.stats.items():
+            if sni in protected_snis:
+                continue
+            if scope != "both" and ps.sni_origin != scope:
+                continue
+            if ps.probed:
+                sni_loss.setdefault(sni, []).append(ps.combined_loss_rate)
+
+        if not sni_loss:
+            return None
+
+        worst_sni = max(sni_loss, key=lambda s: sum(sni_loss[s]) / len(sni_loss[s]))
+        worst_avg = sum(sni_loss[worst_sni]) / len(sni_loss[worst_sni])
+
+        if worst_avg < self.loss_threshold:
+            logger.debug(
+                "SNI eviction skipped — best candidate %s has avg loss %.1f%% < threshold",
+                worst_sni, worst_avg * 100,
+            )
+            return None
+
+        keys_to_remove = [k for k in self.stats if k[1] == worst_sni]
+        ips_for_sni = [k[0] for k in keys_to_remove]
+        sni_origin = self.stats[keys_to_remove[0]].sni_origin if keys_to_remove else "static"
+        for k in keys_to_remove:
+            del self.stats[k]
+        with self._lock:
+            self._unexplored = [k for k in self._unexplored if k[1] != worst_sni]
+            self._all_snis = [s for s in self._all_snis if s != worst_sni]
+
+            self._sni_quarantine[worst_sni] = {
+                "ips": ips_for_sni,
+                "origin": sni_origin,
+                "evicted_at": time.monotonic(),
+                "last_attempt": time.monotonic(),
+                "attempts": 0,
+            }
+
+        logger.info(
+            "Evicted SNI %s to quarantine (avg loss %.1f%%, %d pair(s) removed)",
+            worst_sni, worst_avg * 100, len(keys_to_remove),
+        )
+        return worst_sni
+
+    # ------------------------------------------------------------------
+    # Origin lookup helpers — used when restoring/recycling pairs so the
+    # correct origin tag (static/dynamic) is preserved even when the other
+    # axis (IP or SNI) has since been evicted from self.stats.
+    # ------------------------------------------------------------------
+
+    def _lookup_sni_origin(self, sni: str) -> str:
+        """Best-effort lookup of a SNI's origin from any known source."""
+        for (_ip, s), ps in self.stats.items():
+            if s == sni:
+                return ps.sni_origin
+        if sni in self._sni_quarantine:
+            return self._sni_quarantine[sni].get("origin", "static")
+        return "static"
+
+    def _lookup_ip_origin(self, ip: str) -> str:
+        """Best-effort lookup of an IP's origin from any known source."""
+        for (i, _sni), ps in self.stats.items():
+            if i == ip:
+                return ps.ip_origin
+        if ip in self._ip_quarantine:
+            return self._ip_quarantine[ip].get("origin", "static")
+        return "static"
+
     # ------------------------------------------------------------------
     # Recycling — randomly re-test quarantined IPs and bring back winners
     # ------------------------------------------------------------------
 
-    def recycle_attempt(
+    def recycle_ip_attempt(
         self,
         batch: int,
         min_cooldown: float,
@@ -478,21 +589,21 @@ class CombinationExplorer:
         with self._lock:
             # Enforce the quarantine size cap — drop the oldest entries
             # for good so memory doesn't grow without bound.
-            if len(self._quarantine) > max_quarantine:
+            if len(self._ip_quarantine) > max_quarantine:
                 by_age = sorted(
-                    self._quarantine.items(), key=lambda kv: kv[1]["evicted_at"]
+                    self._ip_quarantine.items(), key=lambda kv: kv[1]["evicted_at"]
                 )
-                overflow = len(self._quarantine) - max_quarantine
+                overflow = len(self._ip_quarantine) - max_quarantine
                 for ip, _ in by_age[:overflow]:
-                    del self._quarantine[ip]
+                    del self._ip_quarantine[ip]
                 logger.debug(
-                    "Quarantine cap (%d) exceeded — dropped %d oldest IP(s) permanently.",
+                    "IP quarantine cap (%d) exceeded — dropped %d oldest IP(s) permanently.",
                     max_quarantine, overflow,
                 )
 
             now = time.monotonic()
             eligible = [
-                ip for ip, info in self._quarantine.items()
+                ip for ip, info in self._ip_quarantine.items()
                 if now - info["last_attempt"] >= min_cooldown
                 and (scope == "both" or info.get("origin", "static") == scope)
             ]
@@ -504,11 +615,11 @@ class CombinationExplorer:
 
         recovered = 0
         for ip in candidates:
-            if self._try_recycle_one(ip):
+            if self._try_recycle_ip_one(ip):
                 recovered += 1
         return recovered
 
-    def _try_recycle_one(self, ip: str) -> bool:
+    def _try_recycle_ip_one(self, ip: str) -> bool:
         """Probe one quarantined IP; if healthy, restore it to active stats.
 
         Uses a fresh, temporary PairStats (no memory of the old failures)
@@ -516,13 +627,13 @@ class CombinationExplorer:
         is the "recycling" equivalent of starting the EMA from scratch.
         """
         with self._lock:
-            info = self._quarantine.get(ip)
+            info = self._ip_quarantine.get(ip)
             if info is None:
                 return False
             info["last_attempt"] = time.monotonic()
             info["attempts"] += 1
             snis = info["snis"] or self._all_snis
-            origin = info.get("origin", "static")
+            ip_origin = info.get("origin", "static")
 
         # Probe with a throwaway PairStats — one SNI is enough to decide
         # whether the IP itself is reachable again; if it is, all of its
@@ -531,30 +642,140 @@ class CombinationExplorer:
         if probe_sni is None:
             return False
 
-        trial = PairStats(ip, probe_sni, origin=origin)
+        trial = PairStats(ip, probe_sni, ip_origin=ip_origin)
         self._probe_one(trial)
 
         # Require a clearly healthy result before trusting the IP again.
         if not trial.alive or trial.combined_loss_rate >= self.loss_threshold:
             logger.debug(
-                "Recycle attempt failed for %s (loss=%.1f%%, alive=%s)",
+                "IP recycle attempt failed for %s (loss=%.1f%%, alive=%s)",
                 ip, trial.combined_loss_rate * 100, trial.alive,
             )
             return False
 
         # Healthy — restore all original (ip, sni) pairs as brand-new
-        # PairStats objects (same origin) so no stale EMA history carries over.
+        # PairStats objects (preserving each axis's own origin) so no stale
+        # EMA history carries over. Only restore pairs whose SNI is still
+        # active (not itself quarantined) — matches the "pair only with
+        # IPs/SNIs that haven't been quarantined" rule used for discovery.
         with self._lock:
-            del self._quarantine[ip]
+            del self._ip_quarantine[ip]
             for sni in snis:
+                if sni in self._sni_quarantine:
+                    continue  # SNI itself is quarantined — don't pair with it
                 key = (ip, sni)
                 if key not in self.stats:
-                    self.stats[key] = PairStats(ip, sni, origin=origin)
+                    sni_origin = self._lookup_sni_origin(sni)
+                    self.stats[key] = PairStats(
+                        ip, sni, ip_origin=ip_origin, sni_origin=sni_origin
+                    )
                     self._unexplored.append(key)
+            if ip not in self._all_ips:
+                self._all_ips.append(ip)
 
         logger.info(
             "Recycled IP %s back into the pool (probe loss=%.1f%%, %d pair(s) restored)",
             ip, trial.combined_loss_rate * 100, len(snis),
+        )
+        return True
+
+    def recycle_sni_attempt(
+        self,
+        batch: int,
+        min_cooldown: float,
+        max_quarantine: int,
+        scope: str = "both",
+    ) -> int:
+        """Randomly re-probe a few quarantined SNIs; recover the healthy ones.
+
+        Mirrors ``recycle_ip_attempt`` exactly, but operates on the SNI
+        quarantine list instead of the IP one.
+
+        Returns:
+            Number of SNIs successfully recovered back into ``self.stats``.
+        """
+        with self._lock:
+            if len(self._sni_quarantine) > max_quarantine:
+                by_age = sorted(
+                    self._sni_quarantine.items(), key=lambda kv: kv[1]["evicted_at"]
+                )
+                overflow = len(self._sni_quarantine) - max_quarantine
+                for sni, _ in by_age[:overflow]:
+                    del self._sni_quarantine[sni]
+                logger.debug(
+                    "SNI quarantine cap (%d) exceeded — dropped %d oldest SNI(s) permanently.",
+                    max_quarantine, overflow,
+                )
+
+            now = time.monotonic()
+            eligible = [
+                sni for sni, info in self._sni_quarantine.items()
+                if now - info["last_attempt"] >= min_cooldown
+                and (scope == "both" or info.get("origin", "static") == scope)
+            ]
+            if not eligible:
+                return 0
+
+            random.shuffle(eligible)
+            candidates = eligible[:batch]
+
+        recovered = 0
+        for sni in candidates:
+            if self._try_recycle_sni_one(sni):
+                recovered += 1
+        return recovered
+
+    def _try_recycle_sni_one(self, sni: str) -> bool:
+        """Probe one quarantined SNI; if healthy, restore it to active stats.
+
+        Uses a fresh, temporary PairStats so a recovered SNI is judged
+        purely on its current behaviour.
+        """
+        with self._lock:
+            info = self._sni_quarantine.get(sni)
+            if info is None:
+                return False
+            info["last_attempt"] = time.monotonic()
+            info["attempts"] += 1
+            ips = info["ips"] or self._all_ips
+            sni_origin = info.get("origin", "static")
+
+        probe_ip = ips[0] if ips else (self._all_ips[0] if self._all_ips else None)
+        if probe_ip is None:
+            return False
+
+        trial = PairStats(probe_ip, sni, sni_origin=sni_origin)
+        self._probe_one(trial)
+
+        if not trial.alive or trial.combined_loss_rate >= self.loss_threshold:
+            logger.debug(
+                "SNI recycle attempt failed for %s (loss=%.1f%%, alive=%s)",
+                sni, trial.combined_loss_rate * 100, trial.alive,
+            )
+            return False
+
+        # Healthy — restore all original (ip, sni) pairs as brand-new
+        # PairStats objects. Only restore pairs whose IP is still active
+        # (not itself quarantined) — same "no pairing with quarantined
+        # entries" rule applied on the SNI side.
+        with self._lock:
+            del self._sni_quarantine[sni]
+            for ip in ips:
+                if ip in self._ip_quarantine:
+                    continue  # IP itself is quarantined — don't pair with it
+                key = (ip, sni)
+                if key not in self.stats:
+                    ip_origin = self._lookup_ip_origin(ip)
+                    self.stats[key] = PairStats(
+                        ip, sni, ip_origin=ip_origin, sni_origin=sni_origin
+                    )
+                    self._unexplored.append(key)
+            if sni not in self._all_snis:
+                self._all_snis.append(sni)
+
+        logger.info(
+            "Recycled SNI %s back into the pool (probe loss=%.1f%%, %d pair(s) restored)",
+            sni, trial.combined_loss_rate * 100, len(ips),
         )
         return True
 
@@ -721,12 +942,22 @@ class ActivePool:
         recycle_min_cooldown: float = 180.0,
         recycle_max_quarantine: int = 100,
         quarantine_scope: str = "both",
+        sni_evict_every: int = 3,
+        sni_evict_count: int = 1,
+        sni_recycle_enabled: bool = True,
+        sni_recycle_every: int = 6,
+        sni_recycle_batch: int = 2,
+        sni_recycle_min_cooldown: float = 180.0,
+        sni_recycle_max_quarantine: int = 100,
+        sni_quarantine_scope: str = "both",
     ) -> None:
         self.explorer = explorer
         self.slots = slots
         self.loss_threshold = loss_threshold
         self.drain_timeout = drain_timeout
         self.max_draining = max_draining
+
+        # IP eviction / recycling parameters.
         self.evict_every = evict_every
         self.evict_count = evict_count
         self.recycle_enabled = recycle_enabled
@@ -737,6 +968,19 @@ class ActivePool:
         # Which IP origin is eligible for eviction + recycling:
         # "static" (CONNECT_IPS only), "dynamic" (discovery only), or "both".
         self.quarantine_scope = quarantine_scope
+
+        # SNI eviction / recycling parameters — mirror the IP ones above,
+        # but operate on the SNI axis (see evict_weakest_sni / *_sni_*).
+        self.sni_evict_every = sni_evict_every
+        self.sni_evict_count = sni_evict_count
+        self.sni_recycle_enabled = sni_recycle_enabled
+        self.sni_recycle_every = sni_recycle_every
+        self.sni_recycle_batch = sni_recycle_batch
+        self.sni_recycle_min_cooldown = sni_recycle_min_cooldown
+        self.sni_recycle_max_quarantine = sni_recycle_max_quarantine
+        # Which SNI origin is eligible for eviction + recycling:
+        # "static" (FAKE_SNIS only), "dynamic" (SNI discovery only), "both".
+        self.sni_quarantine_scope = sni_quarantine_scope
 
         self._pool: List[PairStats] = []
         self._draining: List[PairStats] = []
@@ -828,10 +1072,11 @@ class ActivePool:
                     self._pool.append(ps)
 
             # ── 5. Periodic IP eviction ────────────────────────────────
-            should_evict = (self._refresh_count % self.evict_every == 0)
+            should_evict_ip = (self._refresh_count % self.evict_every == 0)
+            should_evict_sni = (self._refresh_count % self.sni_evict_every == 0)
 
         # Eviction runs outside the lock (it takes its own lock internally).
-        if should_evict:
+        if should_evict_ip:
             protected = self._protected_ips()
             evicted_count = 0
             for _ in range(self.evict_count):
@@ -848,13 +1093,31 @@ class ActivePool:
                     self._refresh_count, evicted_count, self.quarantine_scope,
                 )
 
+        # ── 5b. Periodic SNI eviction — mirrors IP eviction above ──────
+        if should_evict_sni:
+            protected_snis = self._protected_snis()
+            evicted_sni_count = 0
+            for _ in range(self.sni_evict_count):
+                evicted_sni = self.explorer.evict_weakest_sni(
+                    protected_snis, scope=self.sni_quarantine_scope
+                )
+                if not evicted_sni:
+                    break
+                evicted_sni_count += 1
+                protected_snis.discard(evicted_sni)
+            if evicted_sni_count:
+                logger.info(
+                    "SNI eviction cycle %d: removed %d SNI(s) (scope=%s)",
+                    self._refresh_count, evicted_sni_count, self.sni_quarantine_scope,
+                )
+
         # ── 6. Periodic recycling of quarantined IPs ───────────────────
         # Randomly re-test a few evicted IPs; recovered ones are restored
         # to self.explorer.stats with fresh PairStats (no stale history).
         # This runs independently of eviction so recovery isn't tied to
         # the same cadence as removal.
         if self.recycle_enabled and (self._refresh_count % self.recycle_every == 0):
-            recovered = self.explorer.recycle_attempt(
+            recovered = self.explorer.recycle_ip_attempt(
                 batch=self.recycle_batch,
                 min_cooldown=self.recycle_min_cooldown,
                 max_quarantine=self.recycle_max_quarantine,
@@ -864,6 +1127,20 @@ class ActivePool:
                 logger.info(
                     "Recycle cycle %d: restored %d IP(s) from quarantine (scope=%s)",
                     self._refresh_count, recovered, self.quarantine_scope,
+                )
+
+        # ── 6b. Periodic recycling of quarantined SNIs ──────────────────
+        if self.sni_recycle_enabled and (self._refresh_count % self.sni_recycle_every == 0):
+            recovered_sni = self.explorer.recycle_sni_attempt(
+                batch=self.sni_recycle_batch,
+                min_cooldown=self.sni_recycle_min_cooldown,
+                max_quarantine=self.sni_recycle_max_quarantine,
+                scope=self.sni_quarantine_scope,
+            )
+            if recovered_sni:
+                logger.info(
+                    "SNI recycle cycle %d: restored %d SNI(s) from quarantine (scope=%s)",
+                    self._refresh_count, recovered_sni, self.sni_quarantine_scope,
                 )
 
         self._log_pool("REFRESH")
@@ -894,6 +1171,11 @@ class ActivePool:
         """Return the set of IPs that must not be evicted right now."""
         with self._lock:
             return {ps.ip for ps in self._pool + self._draining}
+
+    def _protected_snis(self) -> Set[str]:
+        """Return the set of SNIs that must not be evicted right now."""
+        with self._lock:
+            return {ps.sni for ps in self._pool + self._draining}
 
     # ------------------------------------------------------------------
     # Per-connection interface
@@ -986,6 +1268,14 @@ class ConnectionManager:
         recycle_min_cooldown: float = 180.0,
         recycle_max_quarantine: int = 100,
         quarantine_scope: str = "both",
+        sni_evict_every: int = 3,
+        sni_evict_count: int = 1,
+        sni_recycle_enabled: bool = True,
+        sni_recycle_every: int = 6,
+        sni_recycle_batch: int = 2,
+        sni_recycle_min_cooldown: float = 180.0,
+        sni_recycle_max_quarantine: int = 100,
+        sni_quarantine_scope: str = "both",
     ) -> None:
         self.interval = health_check_interval
 
@@ -1011,6 +1301,14 @@ class ConnectionManager:
             recycle_min_cooldown=recycle_min_cooldown,
             recycle_max_quarantine=recycle_max_quarantine,
             quarantine_scope=quarantine_scope,
+            sni_evict_every=sni_evict_every,
+            sni_evict_count=sni_evict_count,
+            sni_recycle_enabled=sni_recycle_enabled,
+            sni_recycle_every=sni_recycle_every,
+            sni_recycle_batch=sni_recycle_batch,
+            sni_recycle_min_cooldown=sni_recycle_min_cooldown,
+            sni_recycle_max_quarantine=sni_recycle_max_quarantine,
+            sni_quarantine_scope=sni_quarantine_scope,
         )
 
     # ------------------------------------------------------------------
@@ -1063,14 +1361,26 @@ def build_connection_manager(config: dict) -> Optional[ConnectionManager]:
     can fall back to the original direct-target code path.
 
     New config keys (all optional):
-      DRAIN_TIMEOUT     float  Seconds before a draining pair is force-closed
-                               (default: 30)
-      MAX_DRAINING      int    Max simultaneous draining pairs (default: 5)
-      EVICT_EVERY       int    Evict weakest IP every N health cycles (default: 3)
-      QUARANTINE_SCOPE  str    Which IPs are eligible for eviction +
-                               recycling: "static" (CONNECT_IPS only),
-                               "dynamic" (discovery only), or "both"
-                               (default: "both")
+      DRAIN_TIMEOUT        float  Seconds before a draining pair is force-closed
+                                  (default: 30)
+      MAX_DRAINING         int    Max simultaneous draining pairs (default: 5)
+      EVICT_EVERY          int    Evict weakest IP every N health cycles (default: 3)
+      QUARANTINE_SCOPE     str    Which IPs are eligible for eviction +
+                                  recycling: "static" (CONNECT_IPS only),
+                                  "dynamic" (discovery only), or "both"
+                                  (default: "both")
+      SNI_EVICT_EVERY      int    Evict weakest SNI every N health cycles (default: 3)
+      SNI_EVICT_COUNT      int    Number of SNIs evicted per cycle (default: 1)
+      SNI_RECYCLE_ENABLED  bool   Enable SNI recycling (default: True)
+      SNI_RECYCLE_EVERY    int    Attempt SNI recycling every N cycles (default: 6)
+      SNI_RECYCLE_BATCH    int    SNIs re-tested per recycle attempt (default: 2)
+      SNI_RECYCLE_MIN_COOLDOWN  float  Seconds between re-tests of the same
+                                  SNI (default: 180)
+      SNI_RECYCLE_MAX_QUARANTINE int  Cap on SNI quarantine size (default: 100)
+      SNI_QUARANTINE_SCOPE str    Which SNIs are eligible for eviction +
+                                  recycling: "static" (FAKE_SNIS only),
+                                  "dynamic" (SNI discovery only), or "both"
+                                  (default: "both")
     """
     ips: List[str] = config.get("CONNECT_IPS", [])
     snis: List[str] = config.get("FAKE_SNIS", [])
@@ -1096,13 +1406,20 @@ def build_connection_manager(config: dict) -> Optional[ConnectionManager]:
         len(ips), len(snis), len(combinations),
     )
 
-    quarantine_scope = config.get("QUARANTINE_SCOPE", "both")
-    if quarantine_scope not in ("static", "dynamic", "both"):
-        logger.warning(
-            "Invalid QUARANTINE_SCOPE %r — falling back to 'both'.",
-            quarantine_scope,
-        )
-        quarantine_scope = "both"
+    def _validate_scope(value: str, key_name: str) -> str:
+        if value not in ("static", "dynamic", "both"):
+            logger.warning(
+                "Invalid %s %r — falling back to 'both'.", key_name, value
+            )
+            return "both"
+        return value
+
+    quarantine_scope = _validate_scope(
+        config.get("QUARANTINE_SCOPE", "both"), "QUARANTINE_SCOPE"
+    )
+    sni_quarantine_scope = _validate_scope(
+        config.get("SNI_QUARANTINE_SCOPE", "both"), "SNI_QUARANTINE_SCOPE"
+    )
 
     return ConnectionManager(
         combinations=combinations,
@@ -1123,4 +1440,12 @@ def build_connection_manager(config: dict) -> Optional[ConnectionManager]:
         recycle_min_cooldown=config.get("RECYCLE_MIN_COOLDOWN", 180.0),
         recycle_max_quarantine=config.get("RECYCLE_MAX_QUARANTINE", 100),
         quarantine_scope=quarantine_scope,
+        sni_evict_every=config.get("SNI_EVICT_EVERY", 3),
+        sni_evict_count=config.get("SNI_EVICT_COUNT", 1),
+        sni_recycle_enabled=config.get("SNI_RECYCLE_ENABLED", True),
+        sni_recycle_every=config.get("SNI_RECYCLE_EVERY", 6),
+        sni_recycle_batch=config.get("SNI_RECYCLE_BATCH", 2),
+        sni_recycle_min_cooldown=config.get("SNI_RECYCLE_MIN_COOLDOWN", 180.0),
+        sni_recycle_max_quarantine=config.get("SNI_RECYCLE_MAX_QUARANTINE", 100),
+        sni_quarantine_scope=sni_quarantine_scope,
     )
