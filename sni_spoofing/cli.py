@@ -36,6 +36,7 @@ from sni_spoofing.bypass import (
 from sni_spoofing.forwarder import start_server
 from sni_spoofing.pool import build_connection_manager
 from sni_spoofing.ip_discovery import build_ip_discovery
+from sni_spoofing.sni_discovery import build_sni_discovery
 from sni_spoofing.utils import (
     check_platform_capabilities,
     get_default_interface_ipv4,
@@ -658,6 +659,22 @@ def main():
             logger.info(
                 "Dynamic IP discovery: disabled "
                 "(set DYNAMIC_IP_DISCOVERY=true in config to enable)"
+            )
+
+        # ── Start dynamic SNI discovery (optional) ─────────────────────
+        sni_discovery = build_sni_discovery(conn_manager, config)
+        if sni_discovery is not None:
+            sni_discovery.start()
+            logger.info(
+                "Dynamic SNI discovery active — batch=%d  interval=%ds  "
+                "source_refresh=%ds",
+                sni_discovery.scan_batch, int(sni_discovery.scan_interval),
+                int(sni_discovery.source_refresh_interval),
+            )
+        else:
+            logger.info(
+                "Dynamic SNI discovery: disabled "
+                "(set DYNAMIC_SNI_DISCOVERY=true in config to enable)"
             )
 
     # Setup signal handlers for graceful shutdown
