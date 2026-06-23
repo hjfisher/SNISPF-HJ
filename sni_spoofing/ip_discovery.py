@@ -220,7 +220,12 @@ class IPDiscovery:
             cidrs:            Override the built-in Cloudflare CIDR list.
         """
         self.manager = manager
-        self.snis = list(snis)
+        # NOTE: ``snis`` is only used as the *initial* seed list. The actual
+        # list used at injection time always reads live from
+        # ``manager.explorer._all_snis`` via the ``snis`` property below, so
+        # newly discovered dynamic SNIs are automatically included without
+        # this object needing to be told about them separately.
+        self._initial_snis = list(snis)
         self.scan_batch = scan_batch
         self.scan_interval = scan_interval
         self.probe_attempts = probe_attempts
@@ -238,6 +243,18 @@ class IPDiscovery:
         self._dynamic_ips: List[str] = []
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+
+    @property
+    def snis(self) -> List[str]:
+        """Always-current list of SNIs known to the pool's explorer.
+
+        Reading this live (rather than a fixed snapshot taken at __init__)
+        means a newly discovered dynamic SNI is automatically included the
+        next time an IP is injected — no extra wiring needed between
+        IPDiscovery and SNIDiscovery.
+        """
+        live = self.manager.explorer._all_snis
+        return live if live else self._initial_snis
 
     # ------------------------------------------------------------------
     # Public API
@@ -349,7 +366,15 @@ class IPDiscovery:
             self.manager.pool.refresh()
 
     def _inject_ip(self, ip: str) -> int:
-        """Add one new IP × all SNIs into the explorer.  Returns pairs added."""
+        """Add one new IP × all known SNIs into the explorer.
+
+        Only pairs with SNIs that are currently active (not quarantined) —
+        mirrors the same rule used for SNI discovery: never pair a newly
+        found entity with something on the other axis that's been
+        quarantined for poor performance.
+
+        Returns the number of pairs added.
+        """
         with self._lock:
             if ip in self._known_ips:
                 return 0
@@ -367,21 +392,30 @@ class IPDiscovery:
             self._known_ips.add(ip)
             self._dynamic_ips.append(ip)
 
-        # Add PairStats entries for ip × all snis.
+        # Add PairStats entries for ip × all currently-active snis.
         from .pool import PairStats  # local import to avoid circular
 
+        explorer = self.manager.explorer
         added = 0
         for sni in self.snis:
+            # Skip SNIs that have since been quarantined — don't pair a
+            # fresh IP with something already known to be weak.
+            if sni in explorer._sni_quarantine:
+                continue
             key = (ip, sni)
-            if key not in self.manager.explorer.stats:
-                ps = PairStats(ip, sni, origin="dynamic")
-                self.manager.explorer.stats[key] = ps
+            if key not in explorer.stats:
+                sni_origin = explorer._lookup_sni_origin(sni)
+                ps = PairStats(ip, sni, ip_origin="dynamic", sni_origin=sni_origin)
+                explorer.stats[key] = ps
                 # Also add to the unexplored queue so it gets probed soon.
-                with self.manager.explorer._lock:
-                    self.manager.explorer._unexplored.append(key)
+                with explorer._lock:
+                    explorer._unexplored.append(key)
+                    if ip not in explorer._all_ips:
+                        explorer._all_ips.append(ip)
                 added += 1
 
         return added
+
 
     # ------------------------------------------------------------------
     # Diagnostics
