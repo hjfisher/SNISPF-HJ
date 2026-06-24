@@ -643,6 +643,10 @@ class SNIDiscovery:
 
             self._known_snis.add(sni)
             self._dynamic_snis.append(sni)
+            # Permanently record this SNI's origin so later recycle/lookup
+            # operations never misclassify it as static, even if it has
+            # zero active pairs at the moment of lookup.
+            self.manager.explorer._sni_origin_ledger[sni] = "dynamic"
 
         from .pool import PairStats  # local import to avoid circular
 
