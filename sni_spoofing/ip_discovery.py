@@ -383,10 +383,20 @@ class IPDiscovery:
             if len(self._dynamic_ips) >= self.max_dynamic_ips:
                 evicted_ip = self._dynamic_ips.pop(0)
                 self._known_ips.discard(evicted_ip)
+                explorer = self.manager.explorer
                 # Remove evicted pairs from the explorer stats dict.
                 # (They won't be in the active pool since they're old/weak.)
                 for sni in self.snis:
-                    self.manager.explorer.stats.pop((evicted_ip, sni), None)
+                    explorer.stats.pop((evicted_ip, sni), None)
+                # CRITICAL: also drop it from _all_ips and the origin
+                # ledger. Without this, the IP stays "known" to the
+                # explorer forever — every time SNIDiscovery injects a
+                # *new* SNI, it pairs that SNI with all of self._all_ips,
+                # silently resurrecting IPs we just evicted and making
+                # the dynamic-IP cap meaningless over time.
+                if evicted_ip in explorer._all_ips:
+                    explorer._all_ips.remove(evicted_ip)
+                explorer._ip_origin_ledger.pop(evicted_ip, None)
                 logger.debug("Discovery: evicted old IP %s from pool.", evicted_ip)
 
             self._known_ips.add(ip)
