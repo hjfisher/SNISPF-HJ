@@ -639,6 +639,13 @@ class SNIDiscovery:
                 explorer = self.manager.explorer
                 for ip in list(explorer._all_ips):
                     explorer.stats.pop((ip, evicted_sni), None)
+                # CRITICAL: also drop it from _all_snis and the origin
+                # ledger — see the matching fix in ip_discovery.py for why.
+                # Without this, IPDiscovery resurrects evicted SNIs every
+                # time it injects a new IP.
+                if evicted_sni in explorer._all_snis:
+                    explorer._all_snis.remove(evicted_sni)
+                explorer._sni_origin_ledger.pop(evicted_sni, None)
                 logger.debug("SNI discovery: evicted old SNI %s from pool.", evicted_sni)
 
             self._known_snis.add(sni)
