@@ -391,6 +391,11 @@ class IPDiscovery:
 
             self._known_ips.add(ip)
             self._dynamic_ips.append(ip)
+            # Permanently record this IP's origin so later recycle/lookup
+            # operations never misclassify it as static, even if it has
+            # zero active pairs at the moment of lookup.
+            explorer_for_ledger = self.manager.explorer
+            explorer_for_ledger._ip_origin_ledger[ip] = "dynamic"
 
         # Add PairStats entries for ip × all currently-active snis.
         from .pool import PairStats  # local import to avoid circular
