@@ -347,6 +347,19 @@ class CombinationExplorer:
             for ip, sni in combinations
         }
 
+        # Permanent origin ledger — unlike self.stats (which only holds
+        # *currently active* pairs) this never forgets an IP/SNI's origin,
+        # even after it's evicted, quarantined, or temporarily has zero
+        # active pairs. _lookup_ip_origin/_lookup_sni_origin must consult
+        # this instead of guessing "static" as a fallback, or dynamic
+        # entries silently get misclassified as static during recycling.
+        self._ip_origin_ledger: Dict[str, str] = {
+            ip: "static" for ip, _sni in combinations
+        }
+        self._sni_origin_ledger: Dict[str, str] = {
+            sni: "static" for _ip, sni in combinations
+        }
+
         self._unexplored: List[Tuple[str, str]] = list(combinations)
         random.shuffle(self._unexplored)
         self._lock = threading.Lock()
@@ -542,7 +555,17 @@ class CombinationExplorer:
     # ------------------------------------------------------------------
 
     def _lookup_sni_origin(self, sni: str) -> str:
-        """Best-effort lookup of a SNI's origin from any known source."""
+        """Authoritative lookup of a SNI's origin.
+
+        Consults the permanent ledger first (set once, at the moment the
+        SNI first enters the pool, and never erased). Falling back to
+        scanning self.stats/self._sni_quarantine — which only reflects
+        *currently active or quarantined* pairs — previously caused
+        dynamic SNIs with zero active pairs at lookup time to be silently
+        misclassified as "static".
+        """
+        if sni in self._sni_origin_ledger:
+            return self._sni_origin_ledger[sni]
         for (_ip, s), ps in self.stats.items():
             if s == sni:
                 return ps.sni_origin
@@ -551,7 +574,9 @@ class CombinationExplorer:
         return "static"
 
     def _lookup_ip_origin(self, ip: str) -> str:
-        """Best-effort lookup of an IP's origin from any known source."""
+        """Authoritative lookup of an IP's origin — see _lookup_sni_origin."""
+        if ip in self._ip_origin_ledger:
+            return self._ip_origin_ledger[ip]
         for (i, _sni), ps in self.stats.items():
             if i == ip:
                 return ps.ip_origin
