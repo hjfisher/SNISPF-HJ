@@ -34,6 +34,7 @@ from sni_spoofing.bypass import (
     is_raw_available,
 )
 from sni_spoofing.forwarder import start_server
+from sni_spoofing.shaping import TrafficShaper
 from sni_spoofing.pool import build_connection_manager
 from sni_spoofing.ip_discovery import build_ip_discovery
 from sni_spoofing.sni_discovery import build_sni_discovery
@@ -689,6 +690,7 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
     # Run the server
+    shaper = TrafficShaper.from_config(config)
     try:
         asyncio.run(
             start_server(
@@ -701,6 +703,7 @@ def main():
                 interface_ip=interface_ip,
                 raw_injector=raw_injector,
                 conn_manager=conn_manager,
+                shaper=shaper,
             )
         )
     except KeyboardInterrupt:
