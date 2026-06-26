@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover -- Windows
     resource = None  # type: ignore
 
 from .bypass.base import BypassStrategy
+from .shaping import DISABLED_SHAPER, TrafficShaper
 from .tls import ClientHelloBuilder
 
 if TYPE_CHECKING:
@@ -128,6 +129,7 @@ async def handle_connection(
     interface_ip: Optional[str] = None,
     raw_injector=None,
     conn_manager: "Optional[ConnectionManager]" = None,
+    shaper: Optional[TrafficShaper] = None,
 ):
     """Handle a single incoming connection.
 
@@ -149,6 +151,7 @@ async def handle_connection(
     loop = asyncio.get_running_loop()
     outgoing_sock = None
     local_port = None
+    active_shaper = shaper if shaper is not None else DISABLED_SHAPER
 
     # ── Pool integration: pick the best (IP, SNI) pair ────────────────
     # If a ConnectionManager is available, override the static config values
@@ -281,7 +284,7 @@ async def handle_connection(
                     data = await loop.sock_recv(s_in, BUFFER_SIZE)
                     if not data:
                         break
-                    await loop.sock_sendall(s_out, data)
+                    await active_shaper.send(loop, s_out, data, label)
                     # Record success only when we get the first
                     # response from the server (S->C direction).
                     if label == "S->C" and not server_responded:
@@ -374,6 +377,7 @@ async def start_server(
     interface_ip: Optional[str] = None,
     raw_injector=None,
     conn_manager: "Optional[ConnectionManager]" = None,
+    shaper: Optional[TrafficShaper] = None,
 ):
     """Start the TCP forwarding server.
 
@@ -421,6 +425,14 @@ async def start_server(
         logger.info(f"Forwarding to {connect_ip}:{connect_port}")
         logger.info(f"Fake SNI: {fake_sni}")
     logger.info(f"Bypass strategy: {bypass_strategy.name}")
+    if shaper is not None and shaper.enabled:
+        logger.info(
+            f"Traffic shaping: ENABLED (direction={shaper.direction}, "
+            f"chunk={shaper.min_chunk}-{shaper.max_chunk}B, "
+            f"delay={shaper.min_delay_ms}-{shaper.max_delay_ms}ms)"
+        )
+    else:
+        logger.info("Traffic shaping: disabled")
     if raw_injector is not None:
         logger.info("Raw packet injection: ACTIVE (seq_id trick enabled)")
     else:
@@ -444,6 +456,7 @@ async def start_server(
                 interface_ip=interface_ip,
                 raw_injector=raw_injector,
                 conn_manager=conn_manager,
+                shaper=shaper,
             )
 
     try:
