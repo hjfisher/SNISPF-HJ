@@ -439,6 +439,39 @@ class SNIDiscovery:
         self._source_thread: Optional[threading.Thread] = None
         self._discovery_thread: Optional[threading.Thread] = None
 
+    def _sync_with_explorer(self) -> None:
+        """Reconcile our local SNI bookkeeping with the explorer's state.
+
+        Mirrors ``IPDiscovery._sync_with_explorer`` exactly, on the SNI
+        axis. ``pool.py`` can evict or recycle SNIs entirely on its own
+        (via ``ActivePool.refresh()`` → ``evict_weakest_sni`` /
+        ``recycle_sni_attempt``) without this object ever being told.
+
+        Two different signals matter:
+          - ``explorer._sni_origin_ledger`` records a SNI's *origin*
+            permanently, even while it sits in quarantine.
+          - ``explorer._all_snis`` records whether the SNI is *currently
+            active* (has at least one live pair in ``stats``).
+
+        ``dynamic_sni_count`` and the eviction cap need to reflect *active*
+        dynamic SNIs, so we filter on membership in ``_all_snis``, using
+        the ledger only to confirm the origin is "dynamic".
+        """
+        with self._lock:
+            ledger = self.manager.explorer._sni_origin_ledger
+            active_snis = set(self.manager.explorer._all_snis)
+            self._dynamic_snis = [
+                sni for sni in self._dynamic_snis
+                if sni in active_snis and ledger.get(sni) == "dynamic"
+            ]
+            # A dynamic SNI that's merely quarantined (active=False,
+            # ledger=dynamic) should stay "known" so discovery doesn't
+            # re-probe it while pool.py is still tracking it for recycling.
+            self._known_snis = {
+                sni for sni in self._known_snis
+                if sni in active_snis or sni in ledger
+            }
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -466,6 +499,7 @@ class SNIDiscovery:
 
     @property
     def dynamic_sni_count(self) -> int:
+        self._sync_with_explorer()
         with self._lock:
             return len(self._dynamic_snis)
 
@@ -521,7 +555,29 @@ class SNIDiscovery:
             time.sleep(sleep_for)
 
     def _scan_round(self) -> None:
-        """Run one full scan round: sample → resolve → probe → inject."""
+        """Run one full scan round: sample → resolve → probe → inject.
+
+        Skips entirely (no DNS lookups, no TLS probes) once the dynamic
+        SNI cap is reached — there is no point spending resources finding
+        new candidate domains when there's no room to keep them anyway.
+        Discovery resumes automatically the moment a slot frees up (e.g.
+        pool.py evicts a weak dynamic SNI), since _sync_with_explorer keeps
+        the count accurate.
+        """
+        # Reconcile with pool.py's eviction/recycling before checking the
+        # cap — otherwise a stale count could make us skip when a slot is
+        # actually free, or scan when we're actually full.
+        self._sync_with_explorer()
+
+        with self._lock:
+            current_count = len(self._dynamic_snis)
+        if current_count >= self.max_dynamic_snis:
+            logger.debug(
+                "SNI discovery: dynamic SNI cap reached (%d/%d) — skipping scan round.",
+                current_count, self.max_dynamic_snis,
+            )
+            return
+
         with self._domain_pool_lock:
             pool_snapshot = list(self._domain_pool)
 
@@ -629,6 +685,10 @@ class SNIDiscovery:
 
         Returns the number of pairs added.
         """
+        # Reconcile first so the cap check below reflects SNIs pool.py may
+        # have evicted/recycled on its own since our last sync.
+        self._sync_with_explorer()
+
         with self._lock:
             if sni in self._known_snis:
                 return 0
@@ -681,6 +741,7 @@ class SNIDiscovery:
     # ------------------------------------------------------------------
 
     def log_status(self) -> None:
+        self._sync_with_explorer()
         with self._lock:
             dynamic = len(self._dynamic_snis)
             known = len(self._known_snis)
