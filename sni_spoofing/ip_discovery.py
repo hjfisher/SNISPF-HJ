@@ -244,6 +244,51 @@ class IPDiscovery:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
 
+    def _sync_with_explorer(self) -> None:
+        """Reconcile our local IP bookkeeping with the explorer's state.
+
+        ``pool.py`` can evict or recycle IPs entirely on its own (via
+        ``ActivePool.refresh()`` → ``evict_weakest_ip`` /
+        ``recycle_ip_attempt``) without this object ever being told. If we
+        don't reconcile, ``_known_ips``/``_dynamic_ips`` drift out of sync
+        with reality: evicted IPs stay "known" forever (silently blocking
+        re-discovery of that same IP later) and the dynamic-IP count stops
+        reflecting how many IPs are actually active — exactly the stale
+        "Dynamic IPs found" stat seen in the status dashboard.
+
+        Two different signals matter here, and they're not the same thing:
+          - ``explorer._ip_origin_ledger`` records an IP's *origin*
+            (static/dynamic) permanently — even while the IP sits in
+            quarantine, it's still "dynamic" by origin.
+          - ``explorer._all_ips`` records whether the IP is *currently
+            active* (i.e. has at least one live pair in ``stats``).
+            Quarantined IPs are removed from this list; recycled ones are
+            added back.
+
+        ``dynamic_ip_count`` and the eviction cap need to reflect *active*
+        dynamic IPs, not just ones we've ever heard of — so we filter on
+        membership in ``_all_ips``, using the ledger only to confirm the
+        origin is "dynamic" (so we never accidentally drop a static IP
+        that happens to share bookkeeping).
+        """
+        with self._lock:
+            ledger = self.manager.explorer._ip_origin_ledger
+            active_ips = set(self.manager.explorer._all_ips)
+            self._dynamic_ips = [
+                ip for ip in self._dynamic_ips
+                if ip in active_ips and ledger.get(ip) == "dynamic"
+            ]
+            # _known_ips should never block an IP from being reconsidered
+            # once pool.py has fully forgotten it (i.e. it's no longer
+            # active AND no longer in the ledger at all). A dynamic IP
+            # that's merely quarantined (active=False, ledger=dynamic)
+            # should stay "known" so discovery doesn't re-probe it while
+            # pool.py is still tracking it for recycling.
+            self._known_ips = {
+                ip for ip in self._known_ips
+                if ip in active_ips or ip in ledger
+            }
+
     @property
     def snis(self) -> List[str]:
         """Always-current list of SNIs known to the pool's explorer.
@@ -276,6 +321,7 @@ class IPDiscovery:
 
     @property
     def dynamic_ip_count(self) -> int:
+        self._sync_with_explorer()
         with self._lock:
             return len(self._dynamic_ips)
 
@@ -302,7 +348,29 @@ class IPDiscovery:
             time.sleep(sleep_for)
 
     def _scan_round(self) -> None:
-        """Run one full scan round: sample → probe → inject."""
+        """Run one full scan round: sample → probe → inject.
+
+        Skips entirely (no network calls at all) once the dynamic IP cap
+        is reached — there is no point spending bandwidth and CPU probing
+        random new candidates when there's no room to keep them anyway.
+        Discovery resumes automatically the moment a slot frees up (e.g.
+        pool.py evicts a weak dynamic IP), since _sync_with_explorer keeps
+        the count accurate.
+        """
+        # Reconcile with pool.py's eviction/recycling before checking the
+        # cap — otherwise a stale count could make us skip when a slot is
+        # actually free, or scan when we're actually full.
+        self._sync_with_explorer()
+
+        with self._lock:
+            current_count = len(self._dynamic_ips)
+        if current_count >= self.max_dynamic_ips:
+            logger.debug(
+                "IP discovery: dynamic IP cap reached (%d/%d) — skipping scan round.",
+                current_count, self.max_dynamic_ips,
+            )
+            return
+
         candidates = sample_cloudflare_ips(self.scan_batch, self.cidrs)
 
         # Filter out IPs already in the pool.
@@ -375,6 +443,10 @@ class IPDiscovery:
 
         Returns the number of pairs added.
         """
+        # Reconcile first so the cap check below reflects IPs pool.py may
+        # have evicted/recycled on its own since our last sync.
+        self._sync_with_explorer()
+
         with self._lock:
             if ip in self._known_ips:
                 return 0
@@ -437,6 +509,7 @@ class IPDiscovery:
     # ------------------------------------------------------------------
 
     def log_status(self) -> None:
+        self._sync_with_explorer()
         with self._lock:
             dynamic = len(self._dynamic_ips)
             known = len(self._known_ips)
