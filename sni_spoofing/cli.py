@@ -28,6 +28,7 @@ from sni_spoofing import __version__
 from sni_spoofing.bypass import (
     BypassStrategy,
     CombinedBypass,
+    DirectBypass,
     FakeSNIBypass,
     FragmentBypass,
     RawInjector,
@@ -166,6 +167,10 @@ def build_strategy(config: dict, raw_injector=None) -> BypassStrategy:
     """Build the appropriate bypass strategy from config.
 
     Available methods:
+    - "direct": No SNI spoofing at all — forward the client's real
+      ClientHello unmodified. Use when the upstream itself already
+      handles censorship circumvention (e.g. VLESS+Reality, Trojan) and
+      SNISPF-HJ is only being used for its multi-IP connection pool.
     - "fragment": Fragment TLS ClientHello at SNI boundary
     - "fake_sni": Send fake ClientHello with spoofed SNI (needs raw sockets
       for the seq_id trick; falls back to fragmentation without them)
@@ -173,7 +178,9 @@ def build_strategy(config: dict, raw_injector=None) -> BypassStrategy:
     """
     method = config.get("BYPASS_METHOD", "fragment").lower()
 
-    if method == "fragment":
+    if method == "direct":
+        return DirectBypass()
+    elif method == "fragment":
         return FragmentBypass(
             strategy=config.get("FRAGMENT_STRATEGY", "sni_split"),
             fragment_delay=config.get("FRAGMENT_DELAY", 0.1),
@@ -223,6 +230,9 @@ def parse_args():
             "  %(prog)s -l :40443 -c 104.18.38.202:443 -s www.speedtest.net -m combined\n"
             "  %(prog)s --generate-config my_config.json\n"
             "\nBypass Methods:\n"
+            "  direct     - No SNI spoofing; forward client's real SNI as-is\n"
+            "               (use when upstream already handles censorship\n"
+            "               circumvention itself, e.g. VLESS+Reality/Trojan)\n"
             "  fragment   - Fragment TLS ClientHello at SNI boundary (default)\n"
             "  fake_sni   - Inject fake ClientHello (needs root for seq_id trick)\n"
             "  combined   - Both fragmentation and fake SNI (most effective)\n"
@@ -265,7 +275,7 @@ def parse_args():
     # Bypass settings
     parser.add_argument(
         "--method", "-m",
-        choices=["fragment", "fake_sni", "combined"],
+        choices=["direct", "fragment", "fake_sni", "combined"],
         help="Bypass method (default: fragment)",
     )
     parser.add_argument(
