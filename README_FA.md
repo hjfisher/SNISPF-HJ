@@ -44,6 +44,9 @@ Cloudflare** — ایده‌هایی برگرفته از کارهای
 - [امتیازدهی: سلامت یک جفت چطور سنجیده می‌شود؟](#امتیازدهی-سلامت-یک-جفت-چطور-سنجیده-میشود)
 - [حذف، قرنطینه و بازیافت IP](#حذف-قرنطینه-و-بازیافت-ip)
 - [کشف خودکار IP](#کشف-خودکار-ip)
+- [کشف خودکار SNI](#کشف-خودکار-sni)
+- [حذف، قرنطینه و بازیافت SNI](#حذف-قرنطینه-و-بازیافت-sni)
+- [شکل‌دهی ترافیک (Traffic Shaping)](#شکلدهی-ترافیک-traffic-shaping)
 - [پرچم‌های CLI](#پرچمهای-cli)
 - [روش‌های دور زدن](#روشهای-دور-زدن)
 - [استراتژی‌های قطعه‌بندی](#استراتژیهای-قطعهبندی)
@@ -70,8 +73,11 @@ Cloudflare** — ایده‌هایی برگرفته از کارهای
 | بازیافت IP | ندارد | IP های قرنطینه دوباره تست و بازگردانده می‌شوند |
 | دامنهٔ حذف/بازیافت | — | انتخاب فقط static، فقط dynamic، یا هر دو |
 | کشف خودکار IP | ندارد | اسکن رنج‌های رسمی Cloudflare در پس‌زمینه |
+| کشف خودکار SNI | ندارد | نمونه‌گیری از Tranco/Umbrella/Majestic + لیست seed، تأیید میزبانی Cloudflare + TLS |
+| حذف/بازیافت SNI | ندارد | مشابه حذف/بازیافت IP، اما روی محور SNI |
+| شکل‌دهی ترافیک | ندارد | تکه‌بندی/تنظیم زمان‌بندی اختیاری بعد از handshake برای پنهان کردن الگوی ترافیک پروکسی |
 | دستور اجرا | `snispf` | `snispf` **و** `snispf-hj` |
-| ماژول‌های جدید | — | `pool.py`، `ip_discovery.py` |
+| ماژول‌های جدید | — | `pool.py`، `ip_discovery.py`، `sni_discovery.py`، `shaping.py` |
 
 تمام قابلیت‌های اصلی کاملاً حفظ شده‌اند.
 
@@ -315,7 +321,36 @@ Ready! Configure your application to use:
   "DISCOVERY_PROBE_TRIES": 3,
   "DISCOVERY_TIMEOUT": 2.0,
   "DISCOVERY_MIN_SUCCESS": 0.50,
-  "DISCOVERY_MAX_IPS": 200
+  "DISCOVERY_MAX_IPS": 200,
+
+  // ── حذف و بازیافت SNI (مشابه تنظیمات IP در بالا) ────────────────────
+  "SNI_EVICT_EVERY": 3,
+  "SNI_EVICT_COUNT": 1,
+  "SNI_RECYCLE_ENABLED": true,
+  "SNI_RECYCLE_EVERY": 6,
+  "SNI_RECYCLE_BATCH": 2,
+  "SNI_RECYCLE_MIN_COOLDOWN": 180,
+  "SNI_RECYCLE_MAX_QUARANTINE": 100,
+  "SNI_QUARANTINE_SCOPE": "both",     // static | dynamic | both
+
+  // ── کشف خودکار SNI ───────────────────────────────────────────────
+  "DYNAMIC_SNI_DISCOVERY": true,
+  "SNI_DISCOVERY_BATCH": 50,
+  "SNI_DISCOVERY_INTERVAL": 120,
+  "SNI_SOURCE_REFRESH_INTERVAL": 21600,
+  "SNI_DISCOVERY_PROBE_TRIES": 3,
+  "SNI_DISCOVERY_TIMEOUT": 2.0,
+  "SNI_DISCOVERY_MIN_SUCCESS": 0.50,
+  "MAX_DYNAMIC_SNIS": 100,
+  "SNI_DISCOVERY_DOMAINS_PER_SOURCE": 5000,
+
+  // ── شکل‌دهی ترافیک (پیش‌فرض غیرفعال) ─────────────────────────────
+  "TRAFFIC_SHAPING_ENABLED": false,
+  "SHAPING_MIN_CHUNK": 200,
+  "SHAPING_MAX_CHUNK": 1200,
+  "SHAPING_MIN_DELAY_MS": 5,
+  "SHAPING_MAX_DELAY_MS": 40,
+  "SHAPING_DIRECTION": "download_only" // download_only | both
 }
 ```
 
@@ -487,6 +522,104 @@ IP هایی که این‌طور کشف می‌شوند، داخلاً با `ori
 
 ---
 
+## کشف خودکار SNI
+
+معادل کشف خودکار IP اما روی محور SNI، برگرفته از
+[`cf_sni_scanner`](https://github.com/hjfisher/cf_sni_scanner). به‌جای
+نمونه‌گیری IP تصادفی از رنج‌های کلودفلر، این ماژول نام دامنه‌های تصادفی را
+از لیست‌های بزرگ رتبه‌بندی عمومی (Tranco، Cisco Umbrella، Majestic
+Million) به‌علاوهٔ یک لیست seed دستچین‌شده نمونه‌گیری می‌کند، بررسی می‌کند
+که آیا به یک IP کلودفلر resolve می‌شود یا نه، و آن را با یک TLS handshake
+واقعی روی یکی از IP های فعال pool تست می‌کند. دامنه‌هایی که قبول شوند به
+عنوان SNI جدید وارد pool می‌شوند و فقط با IP هایی جفت می‌شوند که در حال
+حاضر قرنطینه نیستند.
+
+چون دانلود لیست‌های رتبه‌بندی نسبتاً سنگین است (هرکدام چند مگابایت
+CSV/ZIP) و این لیست‌ها روز به روز تغییر چندانی نمی‌کنند، کار به دو
+تایمر مستقل تقسیم شده:
+
+- **رفرش منبع** — هر `SNI_SOURCE_REFRESH_INTERVAL` ثانیه (پیش‌فرض: ۶
+  ساعت)، لیست‌های عمومی یک‌بار دانلود، با لیست seed ترکیب، و در حافظه
+  کش می‌شوند. هیچ probeای اینجا انجام نمی‌شود.
+- **کشف** — هر `SNI_DISCOVERY_INTERVAL` ثانیه، یک batch از استخر کش‌شده
+  نمونه‌گیری، resolve، برای میزبانی کلودفلر فیلتر، و با TLS تست می‌شود
+  و در صورت موفقیت وارد pool می‌شود.
+
+| کلید | پیش‌فرض | توضیح |
+|---|---|---|
+| `DYNAMIC_SNI_DISCOVERY` | `false` | فعال‌سازی کشف خودکار SNI (`true` برای فعال) |
+| `SNI_DISCOVERY_BATCH` | `50` | تعداد دامنهٔ کاندیدا نمونه‌گیری‌شده در هر دور |
+| `SNI_DISCOVERY_INTERVAL` | `120` | ثانیه بین دورهای کشف |
+| `SNI_SOURCE_REFRESH_INTERVAL` | `21600` | ثانیه بین دانلود مجدد Tranco/Umbrella/Majestic (پیش‌فرض: ۶ ساعت) |
+| `SNI_DISCOVERY_PROBE_TRIES` | `3` | تعداد تلاش TLS handshake برای هر کاندیدا |
+| `SNI_DISCOVERY_TIMEOUT` | `2.0` | تایم‌اوت هر TLS handshake (ثانیه) |
+| `SNI_DISCOVERY_MIN_SUCCESS` | `0.50` | حداقل نرخ موفقیت برای پذیرش SNI (۰–۱) |
+| `MAX_DYNAMIC_SNIS` | `100` | سقف تعداد SNIهای داینامیک |
+| `SNI_DISCOVERY_DOMAINS_PER_SOURCE` | `5000` | حداکثر دامنه دریافتی از هر منبع رتبه‌بندی |
+
+SNI هایی که این‌طور کشف می‌شوند، مثل کشف IP با `origin = "dynamic"` برچسب
+می‌خورند — همین برچسب است که `SNI_QUARANTINE_SCOPE` برای تفکیک آن‌ها از
+`FAKE_SNIS` دستی‌ات استفاده می‌کند.
+
+---
+
+## حذف، قرنطینه و بازیافت SNI
+
+همان چرخهٔ حذف/قرنطینه/بازیافتی که بالاتر برای IP توضیح داده شد، به‌طور
+مستقل روی SNI هم اعمال می‌شود. هر `SNI_EVICT_EVERY` چرخهٔ سلامت، ضعیف‌ترین
+`SNI_EVICT_COUNT` تا SNI به‌جای حذف کامل، قرنطینه می‌شوند؛ هر
+`SNI_RECYCLE_EVERY` چرخه، دسته‌ای از SNI های قرنطینه با یک TLS handshake
+واقعی دوباره تست و در صورت موفقیت با امتیاز تازه بازگردانده می‌شوند.
+
+| کلید | پیش‌فرض | توضیح |
+|---|---|---|
+| `SNI_EVICT_EVERY` | `3` | هر چند چرخه یک‌بار ضعیف‌ترین SNI حذف شود |
+| `SNI_EVICT_COUNT` | `1` | تعداد SNI حذف‌شده در هر دور eviction |
+| `SNI_RECYCLE_ENABLED` | `true` | فعال/غیرفعال کردن بازیافت SNI |
+| `SNI_RECYCLE_EVERY` | `6` | هر چند چرخه یک‌بار تلاش بازیافت SNI اجرا شود |
+| `SNI_RECYCLE_BATCH` | `2` | چند SNI قرنطینه در هر تلاش دوباره تست شوند |
+| `SNI_RECYCLE_MIN_COOLDOWN` | `180` | حداقل ثانیه بین دو تلاش روی همان SNI |
+| `SNI_RECYCLE_MAX_QUARANTINE` | `100` | سقف اندازهٔ قرنطینهٔ SNI؛ قدیمی‌ترها برای همیشه حذف می‌شوند |
+| `SNI_QUARANTINE_SCOPE` | `"both"` | کدام مبدأ SNI واجد شرایط است: `"static"` (فقط `FAKE_SNIS`)، `"dynamic"` (فقط کشف‌شده)، یا `"both"` |
+
+این به تو اجازه می‌دهد، مثلاً، `FAKE_SNIS` دستی‌ات را از حذف شدن مصون
+نگه‌داری (با کنار گذاشتن حالت `"static"` در `SNI_QUARANTINE_SCOPE`) در
+حالی که SNI های کشف‌شده همچنان چرخش دارند — یا برعکس — کاملاً مستقل از
+تنظیم `QUARANTINE_SCOPE` برای IP ها.
+
+---
+
+## شکل‌دهی ترافیک (Traffic Shaping)
+
+بعضی شبکه‌ها (روی برخی اپراتورهای موبایل مشاهده شده) اجازه می‌دهند
+TLS handshake به‌درستی رد شود — یعنی روش‌های fragmentation/fake-SNI کار
+می‌کنند — اما بعد از آن، خود جریان داده *بعد از handshake* را
+فینگرپرینت می‌کنند. پروتکل‌های پروکسی که ابزارهای بالادستی (VLESS،
+VMess، Trojan، Hysteria و غیره) روی آن حمل می‌شوند، بار ترافیکی بزرگ،
+پیوسته و دوطرفه‌ای تولید می‌کنند که شبیه مرور معمولی HTTPS نیست و به‌محض
+شروع ترافیک واقعی، محدود یا قطع می‌شود.
+
+SNISPF-HJ فقط handshake را مدیریت می‌کند — بعد از آن هر چیزی بایت‌به‌بایت
+بین کلاینت و core بالادستی relay می‌شود. شکل‌دهی ترافیک در همین مسیر
+relay قرار می‌گیرد و جریان بایت خروجی را به تکه‌های تصادفیِ کوچک‌تر با
+تأخیرهای تصادفی بین آن‌ها بازآرایی می‌کند، تا بیشتر شبیه ترافیک معمولی
+وب به‌نظر برسد تا یک تونل پروکسی صاف و سریع.
+
+این قابلیت **به‌طور پیش‌فرض غیرفعال** است، چون تأخیر اضافه می‌کند و فقط
+روی شبکه‌هایی که این نوع فینگرپرینتینگ مبتنی بر جریان را انجام می‌دهند
+مفید است.
+
+| کلید | پیش‌فرض | توضیح |
+|---|---|---|
+| `TRAFFIC_SHAPING_ENABLED` | `false` | فعال‌سازی شکل‌دهی ترافیک |
+| `SHAPING_MIN_CHUNK` | `200` | حداقل اندازهٔ تکه به بایت |
+| `SHAPING_MAX_CHUNK` | `1200` | حداکثر اندازهٔ تکه به بایت |
+| `SHAPING_MIN_DELAY_MS` | `5` | حداقل تأخیر بین تکه‌ها (میلی‌ثانیه) |
+| `SHAPING_MAX_DELAY_MS` | `40` | حداکثر تأخیر بین تکه‌ها (میلی‌ثانیه) |
+| `SHAPING_DIRECTION` | `"download_only"` | `"download_only"` فقط ترافیک سرور→کلاینت را شکل می‌دهد (جایی که معمولاً تشخیص جریان اتفاق می‌افتد)؛ `"both"` آپلود کلاینت→سرور را هم شامل می‌شود |
+
+---
+
 ## پرچم‌های CLI
 
 ```
@@ -628,6 +761,8 @@ SNISPF-HJ/
     │                             # قرنطینه، بازیافت)، ActivePool،
     │                             # ConnectionManager
     ├── ip_discovery.py           # اسکنر خودکار IP از Cloudflare (probe با TLS)
+    ├── sni_discovery.py          # اسکنر خودکار SNI (Tranco/Umbrella/Majestic + لیست seed)
+    ├── shaping.py                # شکل‌دهی ترافیک بعد از handshake (chunking/pacing)
     ├── bypass/                   # استراتژی‌های fragment / fake-SNI / raw
     ├── tls/                      # ساخت و تجزیهٔ ClientHello
     ├── scanner/                  # بررسی گروهی دامنه‌های Cloudflare
@@ -643,11 +778,15 @@ SNISPF-HJ/
 - **[@patterniha](https://github.com/patterniha)** — ایدهٔ اولیهٔ SNI spoofing
   و explorer ترکیب چند-IP/چند-SNI.
 - **[@hjfisher](https://github.com/hjfisher)** — `CombinationExplorer`،
-  `ActivePool`، `ConnectionManager`، `IPDiscovery`، امتیازدهی مبتنی بر EMA،
-  drain timeout، حذف/قرنطینه/بازیافت IP، و یکپارچه‌سازی کلی pool.
+  `ActivePool`، `ConnectionManager`، `IPDiscovery`، `SNIDiscovery`،
+  `TrafficShaper`، امتیازدهی مبتنی بر EMA، drain timeout، حذف/قرنطینه/بازیافت
+  IP و SNI، و یکپارچه‌سازی کلی pool.
 - **[@bia-pain-bache](https://github.com/bia-pain-bache)** و
   **[@Ptechgithub](https://github.com/Ptechgithub)** — روش اسکن IP Cloudflare
   که الهام‌بخش `ip_discovery.py` بود.
+- [`cf_sni_scanner`](https://github.com/hjfisher/cf_sni_scanner) — روش
+  نمونه‌گیری دامنه از Tranco/Umbrella/Majestic که الهام‌بخش
+  `sni_discovery.py` بود.
 
 ---
 
