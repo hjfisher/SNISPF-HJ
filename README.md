@@ -43,6 +43,9 @@ Any idea? → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discuss
 - [Scoring: How a Pair's Health Is Measured](#scoring-how-a-pairs-health-is-measured)
 - [IP Eviction, Quarantine & Recycling](#ip-eviction-quarantine--recycling)
 - [Dynamic IP Discovery](#dynamic-ip-discovery)
+- [Dynamic SNI Discovery](#dynamic-sni-discovery)
+- [SNI Eviction, Quarantine & Recycling](#sni-eviction-quarantine--recycling)
+- [Traffic Shaping](#traffic-shaping)
 - [CLI Flags](#cli-flags)
 - [Bypass Methods](#bypass-methods)
 - [Fragment Strategies](#fragment-strategies)
@@ -69,9 +72,12 @@ Any idea? → **[SNISPF/discussions](https://github.com/Rainman69/SNISPF/discuss
 | IP recycling | No | Quarantined IPs re-tested and restored if healthy |
 | Eviction/recycle scope | — | Choose static-only, dynamic-only, or both |
 | Dynamic IP discovery | No | Scans Cloudflare CIDR ranges at runtime |
+| Dynamic SNI discovery | No | Samples Tranco/Umbrella/Majestic + seed list, verifies Cloudflare hosting + TLS |
+| SNI eviction/recycling | No | Mirrors IP eviction/recycling, but on the SNI axis |
+| Traffic shaping | No | Optional post-handshake chunking/pacing to obscure proxy-protocol flow patterns |
 | Entry point | `snispf` | `snispf` **and** `snispf-hj` |
 | Config keys | `CONNECT_IP`, `FAKE_SNI` | `CONNECT_IPS` (list), `FAKE_SNIS` (list) |
-| New modules | — | `pool.py`, `ip_discovery.py` |
+| New modules | — | `pool.py`, `ip_discovery.py`, `sni_discovery.py`, `shaping.py` |
 
 All original features (fragmentation, fake-SNI, combined, domain checker, raw
 injection, TTL trick) are fully preserved.
@@ -330,7 +336,36 @@ CLI flags override config file values.
   "DISCOVERY_PROBE_TRIES": 3,
   "DISCOVERY_TIMEOUT": 2.0,
   "DISCOVERY_MIN_SUCCESS": 0.50,
-  "DISCOVERY_MAX_IPS": 200
+  "DISCOVERY_MAX_IPS": 200,
+
+  // ── SNI eviction & recycling (mirrors the IP settings above) ───────
+  "SNI_EVICT_EVERY": 3,
+  "SNI_EVICT_COUNT": 1,
+  "SNI_RECYCLE_ENABLED": true,
+  "SNI_RECYCLE_EVERY": 6,
+  "SNI_RECYCLE_BATCH": 2,
+  "SNI_RECYCLE_MIN_COOLDOWN": 180,
+  "SNI_RECYCLE_MAX_QUARANTINE": 100,
+  "SNI_QUARANTINE_SCOPE": "both",     // static | dynamic | both
+
+  // ── Dynamic SNI discovery ───────────────────────────────────────────
+  "DYNAMIC_SNI_DISCOVERY": true,
+  "SNI_DISCOVERY_BATCH": 50,
+  "SNI_DISCOVERY_INTERVAL": 120,
+  "SNI_SOURCE_REFRESH_INTERVAL": 21600,
+  "SNI_DISCOVERY_PROBE_TRIES": 3,
+  "SNI_DISCOVERY_TIMEOUT": 2.0,
+  "SNI_DISCOVERY_MIN_SUCCESS": 0.50,
+  "MAX_DYNAMIC_SNIS": 100,
+  "SNI_DISCOVERY_DOMAINS_PER_SOURCE": 5000,
+
+  // ── Traffic shaping (off by default) ────────────────────────────────
+  "TRAFFIC_SHAPING_ENABLED": false,
+  "SHAPING_MIN_CHUNK": 200,
+  "SHAPING_MAX_CHUNK": 1200,
+  "SHAPING_MIN_DELAY_MS": 5,
+  "SHAPING_MAX_DELAY_MS": 40,
+  "SHAPING_DIRECTION": "download_only" // download_only | both
 }
 ```
 
@@ -499,6 +534,101 @@ what `QUARANTINE_SCOPE` uses to distinguish them from your `CONNECT_IPS`.
 
 ---
 
+## Dynamic SNI Discovery
+
+The SNI counterpart to IP discovery, ported from
+[`cf_sni_scanner`](https://github.com/hjfisher/cf_sni_scanner). Instead of
+sampling random IPs from Cloudflare's ranges, it samples random *domain
+names* from large public ranking lists (Tranco, Cisco Umbrella, Majestic
+Million) plus a curated seed list, checks whether each one resolves to a
+Cloudflare IP, and probes it with a real TLS handshake against one of the
+pool's active IPs. Domains that pass are injected into the pool as new SNIs,
+paired only with IPs that aren't currently quarantined.
+
+Because downloading the ranking lists is relatively heavy (each is a
+multi-megabyte CSV/ZIP) and they barely change day to day, the work is split
+into two independent timers:
+
+- **Source refresh** — every `SNI_SOURCE_REFRESH_INTERVAL` seconds (default:
+  6 hours), the public lists are downloaded once, merged with the seed list,
+  and cached in memory. No probing happens here.
+- **Discovery** — every `SNI_DISCOVERY_INTERVAL` seconds, a batch is sampled
+  from the cached pool, resolved, filtered for Cloudflare hosting, and
+  probed with TLS before being injected into the pool.
+
+| Key | Default | Description |
+|---|---|---|
+| `DYNAMIC_SNI_DISCOVERY` | `false` | Enable SNI discovery (set `true` to activate) |
+| `SNI_DISCOVERY_BATCH` | `50` | Candidate domains sampled per discovery round |
+| `SNI_DISCOVERY_INTERVAL` | `120` | Seconds between discovery rounds |
+| `SNI_SOURCE_REFRESH_INTERVAL` | `21600` | Seconds between re-downloading Tranco/Umbrella/Majestic (default: 6h) |
+| `SNI_DISCOVERY_PROBE_TRIES` | `3` | TLS handshake attempts per candidate |
+| `SNI_DISCOVERY_TIMEOUT` | `2.0` | TLS handshake timeout per attempt (s) |
+| `SNI_DISCOVERY_MIN_SUCCESS` | `0.50` | Minimum success rate to accept an SNI (0–1) |
+| `MAX_DYNAMIC_SNIS` | `100` | Cap on dynamically discovered SNIs |
+| `SNI_DISCOVERY_DOMAINS_PER_SOURCE` | `5000` | Max domains pulled from each ranking list |
+
+SNIs found this way are tagged with `origin = "dynamic"`, mirroring IP
+discovery — this is what `SNI_QUARANTINE_SCOPE` uses to tell them apart from
+your hand-picked `FAKE_SNIS`.
+
+---
+
+## SNI Eviction, Quarantine & Recycling
+
+The same eviction/quarantine/recycling lifecycle described above for IPs
+applies independently to SNIs. Every `SNI_EVICT_EVERY` health cycles, the
+`SNI_EVICT_COUNT` weakest SNIs are quarantined instead of deleted; every
+`SNI_RECYCLE_EVERY` cycles, a batch of quarantined SNIs is re-tested with a
+real TLS handshake and restored with a fresh score if they pass.
+
+| Key | Default | Description |
+|---|---|---|
+| `SNI_EVICT_EVERY` | `3` | Evict weakest SNI every N health cycles |
+| `SNI_EVICT_COUNT` | `1` | Number of SNIs to evict per eviction cycle |
+| `SNI_RECYCLE_ENABLED` | `true` | Enable/disable SNI recycling |
+| `SNI_RECYCLE_EVERY` | `6` | Attempt SNI recycling every N health cycles |
+| `SNI_RECYCLE_BATCH` | `2` | How many quarantined SNIs to re-test per attempt |
+| `SNI_RECYCLE_MIN_COOLDOWN` | `180` | Minimum seconds between re-test attempts on the same SNI |
+| `SNI_RECYCLE_MAX_QUARANTINE` | `100` | Cap on SNI quarantine size; oldest entries dropped beyond this |
+| `SNI_QUARANTINE_SCOPE` | `"both"` | Which SNI origin is eligible: `"static"` (`FAKE_SNIS` only), `"dynamic"` (discovered only), or `"both"` |
+
+This lets you, for example, protect your hand-picked `FAKE_SNIS` from ever
+being evicted (`SNI_QUARANTINE_SCOPE: "static"` excluded) while still
+churning through discovered SNIs, or vice versa — independently of how
+`QUARANTINE_SCOPE` is set for IPs.
+
+---
+
+## Traffic Shaping
+
+Some networks (observed on certain mobile carriers) let the TLS handshake
+through fine — the fragmentation/fake-SNI bypass works — but then
+fingerprint the *post-handshake* data stream itself. Proxy protocols carried
+by upstream tools (VLESS/VMess/Trojan/Hysteria, etc.) produce large, steady,
+bidirectional bursts that don't look like normal HTTPS browsing, and get
+throttled or reset once real traffic starts flowing.
+
+SNISPF-HJ only owns the handshake — everything after that is relayed
+byte-for-byte to/from the upstream core. Traffic shaping sits in that relay
+path and reshapes the outgoing byte stream into smaller, randomly-sized
+chunks with random delays between them, so it looks more like ordinary web
+traffic instead of a flat, fast proxy tunnel.
+
+It's **disabled by default**, since it adds latency and only helps on
+networks that do this kind of flow-based fingerprinting.
+
+| Key | Default | Description |
+|---|---|---|
+| `TRAFFIC_SHAPING_ENABLED` | `false` | Enable traffic shaping |
+| `SHAPING_MIN_CHUNK` | `200` | Minimum chunk size in bytes |
+| `SHAPING_MAX_CHUNK` | `1200` | Maximum chunk size in bytes |
+| `SHAPING_MIN_DELAY_MS` | `5` | Minimum delay between chunks (ms) |
+| `SHAPING_MAX_DELAY_MS` | `40` | Maximum delay between chunks (ms) |
+| `SHAPING_DIRECTION` | `"download_only"` | `"download_only"` shapes only server→client traffic (where flow detection typically happens); `"both"` also paces client→server uploads |
+
+---
+
 ## CLI Flags
 
 ```
@@ -639,6 +769,8 @@ SNISPF-HJ/
     │                             # quarantine, recycling), ActivePool,
     │                             # ConnectionManager
     ├── ip_discovery.py           # Dynamic Cloudflare IP scanner (TLS probe)
+    ├── sni_discovery.py          # Dynamic SNI scanner (Tranco/Umbrella/Majestic + seed list)
+    ├── shaping.py                # Post-handshake traffic shaping (chunking/pacing)
     ├── bypass/                   # Fragment / fake-SNI / raw-injection
     ├── tls/                      # ClientHello builder + parser
     ├── scanner/                  # Bulk Cloudflare domain checker
@@ -654,11 +786,15 @@ SNISPF-HJ/
 - **[@patterniha](https://github.com/patterniha)** — original SNI-spoofing concept
   and the multi-IP/SNI combination explorer idea.
 - **[@hjfisher](https://github.com/hjfisher)** — `CombinationExplorer`,
-  `ActivePool`, `ConnectionManager`, `IPDiscovery`, EMA-based scoring, drain
-  timeout, IP eviction/quarantine/recycling, and overall pool integration.
+  `ActivePool`, `ConnectionManager`, `IPDiscovery`, `SNIDiscovery`,
+  `TrafficShaper`, EMA-based scoring, drain timeout, IP/SNI
+  eviction/quarantine/recycling, and overall pool integration.
 - **[@bia-pain-bache](https://github.com/bia-pain-bache)** and
   **[@Ptechgithub](https://github.com/Ptechgithub)** — Cloudflare IP scanning
   methodology that inspired `ip_discovery.py`.
+- [`cf_sni_scanner`](https://github.com/hjfisher/cf_sni_scanner) — Tranco /
+  Umbrella / Majestic domain sampling methodology that inspired
+  `sni_discovery.py`.
 
 ---
 
